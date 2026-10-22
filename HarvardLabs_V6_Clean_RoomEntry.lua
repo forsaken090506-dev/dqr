@@ -165733,6 +165733,21 @@ do
     local lastScanAt = 0
     local lastCharacter = nil
     local routeDir = nil
+    local failedHeadings = {}
+    local lastCommandDir = nil
+    local failedThisFrame = false
+    local function failedHeading(direction, now)
+        if not direction or direction.Magnitude < 0.01 then return false end
+        for index = #failedHeadings, 1, -1 do
+            local failure = failedHeadings[index]
+            if now >= failure.untilAt then
+                table.remove(failedHeadings, index)
+            elseif direction.Unit:Dot(failure.direction) > 0.8 then
+                return true
+            end
+        end
+        return false
+    end
     local committedDir = nil
     local commitUntil = 0
     local progressPos = nil
@@ -165741,9 +165756,10 @@ do
     local sensedRoots, sensorAt = {}, -math.huge
     local forcedLook = false
     local savedAutoRotate = true
-    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-22-opening-clearance-wait-guard" }
+    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-22-failed-heading-recovery" }
     local motionSignal = runService.RenderStepped or runService.Heartbeat
-    context.V6RoomEntry.connection = (motionSignal):Connect(function()
+    _G.HL_V6_CONTROLLER_REPORT = context.V6RoomEntry
+    local function controllerTick()
         context.V6RoomEntry.frames = (context.V6RoomEntry.frames or 0) + 1
         if context.RT.destroyed or not context.RT.farmEnabled then return end
         local character = localPlayer.Character
@@ -165753,6 +165769,7 @@ do
         if character ~= lastCharacter then
             lastCharacter, idleAt, routeDir = character, os.clock(), nil
             sensedRoots, sensorAt = {}, -math.huge
+            failedHeadings, lastCommandDir = {}, nil
             committedDir, commitUntil = nil, 0
             progressPos, progressAt = root.Position, os.clock()
             rayParams = RaycastParams.new()
@@ -165764,6 +165781,7 @@ do
             forcedLook, savedAutoRotate = false, humanoid.AutoRotate
         end
         local now = os.clock()
+        failedThisFrame = false
         local moving = humanoid.MoveDirection.Magnitude > 0.08
         if moving then idleAt = now end
         -- A hazard-free direction is still useless when it points into a
@@ -165771,8 +165789,17 @@ do
         -- displacement so the next scan can choose an open escape instead.
         if not progressPos or (root.Position - progressPos).Magnitude >= 0.35 then
             progressPos, progressAt = root.Position, now
-        elseif committedDir and now - progressAt >= 0.16 then
-            committedDir, commitUntil = nil, 0
+        elseif lastCommandDir and now - progressAt >= 0.25 then
+            -- Resetting commitment alone selected the same failed lane again.
+            -- Briefly penalize the failed heading, while retaining it as a
+            -- fallback if every alternative becomes unsafe or blocked.
+            failedHeadings[#failedHeadings + 1] = {
+                direction = lastCommandDir, untilAt = now + 0.8,
+            }
+            failedThisFrame = true
+            committedDir, commitUntil, routeDir = nil, 0, nil
+            progressPos, progressAt, lastScanAt = root.Position, now, -math.huge
+            context.V6RoomEntry.failedMoves = (context.V6RoomEntry.failedMoves or 0) + 1
         end
         local pingS = context.RT and (context.RT.pingS or context.RT.dataPingS) or 0
         local pingLead = math.clamp((tonumber(pingS) or 0) + 0.16, 0, 0.60)
@@ -166012,10 +166039,11 @@ do
             end
             return true
         end
-        local stalled = now - progressAt >= 0.25
+        local stalled = failedThisFrame or now - progressAt >= 0.25
         local wasWaiting = context.V6RoomEntry.waiting == true
         if specializedEscape and not enemyEmergency and not stalled and not wasWaiting
-            and moving and laneOpen(humanoid.MoveDirection, false) then
+            and moving and not failedHeading(humanoid.MoveDirection, now)
+            and laneOpen(humanoid.MoveDirection, false) then
             committedDir, commitUntil, routeDir = nil, 0, nil
             idleAt = now
             return
@@ -166045,6 +166073,7 @@ do
             end
             if laneSafe then
                 routeDir = committedDir
+                lastCommandDir = routeDir
                 humanoid:Move(routeDir, false)
                 return
             end
@@ -166076,7 +166105,8 @@ do
             local currentSafe = currentOk and type(currentRisk) == "number" and currentRisk < riskLimit
             local forwardSafe = quickOk and type(quickRisk) == "number" and quickRisk < riskLimit
             if currentSafe and forwardSafe and not enemyTooClose and not orbTooClose
-                and not stalled and not wasWaiting and laneOpen(heading, false) then
+                and not stalled and not wasWaiting and not failedHeading(heading, now)
+                and laneOpen(heading, false) then
                 return
             end
         end
@@ -166086,6 +166116,7 @@ do
         -- reacts quickly without blocking the render step.
         if now - lastScanAt < 0.010 and not stalled and not wasWaiting then
             if routeDir and routeDir.Magnitude > 0.01 then
+                lastCommandDir = routeDir
                 humanoid:Move(routeDir, false)
             end
             return
@@ -166117,7 +166148,7 @@ do
                     basis.X * c - basis.Z * s, 0,
                     basis.X * s + basis.Z * c
                 )
-                local score = 0
+                local score = failedHeading(candidate, now) and 25000 or 0
                 local hardUnsafe = false
                 local lastUnsafe = 0
                 local physicalOpen = laneOpen(candidate, false)
@@ -166215,6 +166246,8 @@ do
                 if canWait then
                     committedDir, commitUntil, routeDir = nil, 0, nil
                     context.V6RoomEntry.waiting = true
+                    lastCommandDir = nil
+                    context.V6RoomEntry.lastDecision = "wait: stationary interval checked"
                     humanoid:Move(Vector3.zero, false)
                     return -- no cooldown: re-score every frame until a route opens
                 end
@@ -166269,7 +166302,7 @@ do
                 local retreat = Vector3.new(awayX, 0, awayZ).Unit
                 -- Never replace a fully checked dodge with a retreat that
                 -- crosses a live floor attack or runs into room geometry.
-                if laneOpen(retreat, true) then dir = retreat end
+                if not failedHeading(retreat, now) and laneOpen(retreat, true) then dir = retreat end
             end
         end
         if not dir then
@@ -166283,10 +166316,24 @@ do
                 committedDir = routeDir
                 commitUntil = now + (enemyEmergency and 0.70 or 1.25)
             end
+            lastCommandDir = routeDir
+            context.V6RoomEntry.lastDecision = "move: selected escape heading"
             humanoid:Move(routeDir, false)
             idleAt = os.clock()
             context.V6RoomEntry.kicks = context.V6RoomEntry.kicks + 1
             context.V6RoomEntry.last = {at = os.clock(), x = routeDir.X, z = routeDir.Z}
+        end
+    end
+    context.V6RoomEntry.connection = (motionSignal):Connect(function()
+        local ok, err = pcall(controllerTick)
+        if not ok then
+            local report = context.V6RoomEntry
+            report.errors = (report.errors or 0) + 1
+            report.lastError = tostring(err)
+            if os.clock() - (report.lastWarnAt or -math.huge) > 2 then
+                report.lastWarnAt = os.clock()
+                warn("[HL V6 controller] " .. report.lastError)
+            end
         end
     end)
 end
