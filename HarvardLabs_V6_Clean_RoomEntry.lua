@@ -1317,8 +1317,8 @@ components.coreSettings = function(context)
     config.itemGodpot = true
     config.birdsEyeCam = false
     config.speedCustom = false
-    config.speedNormal = 20
-    config.speedBurst = 28
+    config.speedNormal = 27
+    config.speedBurst = 27
 
     -- V4.7 Hardcore survival: diagnostics and ranged-position safety.
     -- V4 Hardcore Survival Profile (conservative first pass).
@@ -7970,7 +7970,7 @@ end
 components.movementBoost = function(context)
     local config, runtimeState = context.CFG, context.RT
     local localPlayer, config2 =
-        context.LocalPlayer, { TargetSpeed = 25, MinSpeed = 25, MaxSpeed = 27, FallbackSpeed = 25 }
+        context.LocalPlayer, { TargetSpeed = 27, MinSpeed = 27, MaxSpeed = 27, FallbackSpeed = 27 }
     local sharedValue = localPlayer.Character
     local sharedValue2, sharedValue3, sharedValue4, moverHeading =
         sharedValue and (sharedValue:FindFirstChildOfClass("Humanoid")), false
@@ -7999,8 +7999,9 @@ components.movementBoost = function(context)
             local value = sharedValue5
             return value
         end
-        local locomotionSpeed =
-            math.clamp(tonumber(argument) or config2.TargetSpeed, config2.MinSpeed, config2.MaxSpeed)
+        -- One speed for walking, dodging and spell transitions. Native
+        -- burst-cap updates must not reopen a higher locomotion speed.
+        local locomotionSpeed = config2.TargetSpeed
         if sharedValue3 then
             if math.abs(locomotionSpeed - sharedValue5) >= 2 then
                 sharedValue5 = locomotionSpeed
@@ -51981,7 +51982,6 @@ components.movementCombat = function(context)
         end
     end
     local function buffSeen()
-        capturedContext[2].speedSpellLatched = nil
         movement.controlsOff = false
         movement.controlsAt = 0
         movement.stallLogged = false
@@ -52006,7 +52006,7 @@ components.movementCombat = function(context)
         return true
     end
     context.speedNormal = function()
-        return capturedContext[2].speedSpellLatched and 27 or 25
+        return 27
     end
     context.speedBurst = function()
         return 27
@@ -52165,7 +52165,6 @@ components.movementCombat = function(context)
             local walkSpeed2 = context.speedNormal()
             local value4 = context.speedBurst()
             if context.speedAbilityOn(os.clock()) then
-                capturedContext[2].speedSpellLatched = true
                 if not capturedContext[2].speedBuffHeld then
                     if math.abs(humanoid3.WalkSpeed - value4) > 0.01 then
                         if math.abs(humanoid3.WalkSpeed - walkSpeed2) > 0.01 then
@@ -165786,7 +165785,7 @@ do
     local sensedRoots, sensorAt = {}, -math.huge
     local forcedLook = false
     local savedAutoRotate = true
-    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-22-escape-continuity" }
+    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-22-release-cleared-retreat" }
     -- Run after render/player input and immediately before physical movement.
     local motionSignal = runService.PreSimulation or runService.RenderStepped or runService.Heartbeat
     _G.HL_V6_CONTROLLER_REPORT = context.V6RoomEntry
@@ -165874,7 +165873,7 @@ do
         -- Reapply after native/spell resets, before prediction uses the speed.
         -- Respect an actual game hold rather than walking out of a stun.
         if context.speedNormal and humanoid.WalkSpeed > 0 then
-            humanoid.WalkSpeed = math.max(humanoid.WalkSpeed, context.speedNormal())
+            humanoid.WalkSpeed = context.speedNormal()
         end
         -- Movement auto-rotation was winning the final frame against the
         -- Archpriestess LOOK AWAY controller. That caused the stun visible at
@@ -166121,6 +166120,49 @@ do
         end
         local stalled = failedThisFrame or now - progressAt >= 0.25
         local wasWaiting = context.V6RoomEntry.waiting == true
+        -- Do not compete with the game's normal movement controller while it
+        -- is already carrying us through a safe lane. The watchdog only takes
+        -- ownership when the next short step is genuinely dangerous.
+        if moving and context.dangerAt then
+            local heading = humanoid.MoveDirection.Unit
+            local travelLead = 0.12
+            local hazardLead = travelLead + pingLead
+            local probe = root.Position + heading * math.max(humanoid.WalkSpeed, 12) * travelLead
+            local currentOk, currentRisk = pcall(
+                routeDanger,
+                root.Position.X,
+                root.Position.Y,
+                root.Position.Z,
+                0
+            )
+            local quickOk, quickRisk = pcall(
+                routeDanger,
+                probe.X,
+                probe.Y,
+                probe.Z,
+                travelLead
+            )
+            local currentSafe = currentOk and type(currentRisk) == "number" and currentRisk < riskLimit
+            local forwardSafe = quickOk and type(quickRisk) == "number" and quickRisk < riskLimit
+            local currentClearance = enemyDistance(root.Position)
+            local forwardClearance = enemyDistance(probe, hazardLead)
+            -- Outside the planning buffer, allow normal approach again.
+            -- Inside it, allow a checked tangent/away route, but never hand
+            -- back a command that enters the immediate enemy envelope.
+            local enemyLaneSafe = not enemyTooClose
+                or (not enemyEmergency and currentClearance >= 30
+                    and forwardClearance >= math.min(38, currentClearance) - 0.5)
+            if currentSafe and forwardSafe and enemyLaneSafe and not orbTooClose
+                and not stalled and not wasWaiting and not failedHeading(heading, now)
+                and laneOpen(heading, false) then
+                -- Once danger has cleared, approaching the next target is
+                -- legitimate progress, even when it reverses the old dodge.
+                committedDir, commitUntil, routeDir = nil, 0, nil
+                lastCommandDir, lastOwnedAt, lastScanAt = nil, -math.huge, -math.huge
+                report.lastDecision = "yield: safe native route; retreat complete"
+                return
+            end
+        end
         -- Keep ownership of an established escape lane long enough to clear
         -- the whole telegraph. This prevents the combat controller from
         -- steering back toward the enemies halfway through the dodge.
@@ -166177,38 +166219,6 @@ do
             committedDir, commitUntil, routeDir = nil, 0, nil
             idleAt = now
             return
-        end
-        -- Do not compete with the game's normal movement controller while it
-        -- is already carrying us through a safe lane. The watchdog only takes
-        -- ownership when the next short step is genuinely dangerous.
-        if moving and context.dangerAt then
-            local heading = humanoid.MoveDirection.Unit
-            local travelLead = 0.12
-            local hazardLead = travelLead + pingLead
-            local probe = root.Position + heading * math.max(humanoid.WalkSpeed, 12) * travelLead
-            local currentOk, currentRisk = pcall(
-                context.dangerAt,
-                root.Position.X,
-                root.Position.Y,
-                root.Position.Z,
-                pingLead
-            )
-            local quickOk, quickRisk = pcall(
-                context.dangerAt,
-                probe.X,
-                probe.Y,
-                probe.Z,
-                hazardLead
-            )
-            local currentSafe = currentOk and type(currentRisk) == "number" and currentRisk < riskLimit
-            local forwardSafe = quickOk and type(quickRisk) == "number" and quickRisk < riskLimit
-            if currentSafe and forwardSafe and not enemyTooClose and not orbTooClose
-                and not stalled and not wasWaiting and not failedHeading(heading, now)
-                and laneOpen(heading, false)
-                and (not lastCommandDir or now - lastOwnedAt > 0.75
-                    or heading:Dot(lastCommandDir) >= 0) then
-                return
-            end
         end
         -- Route selection is expensive; movement itself stays continuous by
         -- replaying the last safe heading between scans. Refresh at roughly
