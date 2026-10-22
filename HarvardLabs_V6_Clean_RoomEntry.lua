@@ -165950,6 +165950,51 @@ do
                 end
             end
         end
+        -- A Knight circle is centered on a nearby enemy by design. Its
+        -- geometric rim exit must not be preempted merely by that proximity.
+        -- Validate the fresh complete route, rather than substituting a short
+        -- heading which may never reach the circle boundary.
+        local circleGoal = context.BB and context.BB.goal
+        if type(movementState) == "string" and movementState:sub(1, 8) == "KCIRCLE:"
+            and circleGoal and circleGoal.name == "kcircle rim exit" and circleGoal.p
+            and now - (circleGoal.at or -math.huge) >= 0
+            and now - (circleGoal.at or -math.huge) < 0.25
+            and now - progressAt < 0.25
+            and context.gsLineClear and context.dangerAt then
+            local destination = circleGoal.p
+            local delta = Vector3.new(destination.X - root.Position.X, 0,
+                destination.Z - root.Position.Z)
+            local length = delta.Magnitude
+            local ok, clear = pcall(context.gsLineClear, root.Position, destination)
+            local safe = ok and clear == true and length > 0.5
+            local exited = false
+            local speed = math.max(humanoid.WalkSpeed, 12)
+            local steps = math.clamp(math.ceil(length / 1.5), 1, 80)
+            for index = 1, steps + 1 do
+                if not safe then break end
+                local fraction = math.min(index / steps, 1)
+                local probe = root.Position + delta * fraction
+                local lead = length * fraction / speed + pingLead
+                    + (index > steps and 0.25 or 0)
+                local riskOk, risk = pcall(context.dangerAt, probe.X, probe.Y, probe.Z, lead)
+                if not riskOk or type(risk) ~= "number" then
+                    safe = false
+                elseif risk < (enemyEmergency and 0.12 or 0.24) then
+                    exited = true
+                elseif exited or index >= steps then
+                    -- Starting inside the circle is unavoidable; entering
+                    -- another attack after clearing it is not a valid exit.
+                    safe = false
+                end
+            end
+            if safe and exited then
+                committedDir, commitUntil, routeDir = nil, 0, nil
+                idleAt = now
+                context.V6RoomEntry.circleRouteHeld =
+                    (context.V6RoomEntry.circleRouteHeld or 0) + 1
+                return -- native circle mover retains the checked rim target
+            end
+        end
         if specializedEscape and not enemyEmergency then
             committedDir, commitUntil, routeDir = nil, 0, nil
             idleAt = now
