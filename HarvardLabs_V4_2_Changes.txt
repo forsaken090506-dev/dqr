@@ -1,0 +1,19 @@
+Harvard Labs V4.2 Hardcore Review (experimental)
+
+Changes from V4.1:
+- Hardcore preset disables arena-clear resets and post-Bob resets, in addition to the existing resetInHardcore=false gate. This prevents those two intentional reset paths from being enabled by the preset.
+- Bounded damage history (up to 80 recent sampled health drops) with health percentages, timestamps, and character root coordinates to help diagnose risky areas.
+- Death timestamps and version marker in _G.HL_V4_HC_REPORT.
+
+Enable before loading:
+getgenv().HL_V4_HARDCORE = true
+
+After testing, inspect:
+_G.HL_V4_HC_REPORT
+_G.HL_V4_HC_REPORT.damageEvents
+
+Limitations:
+- Damage is sampled every 0.25 seconds; multiple hits between samples can merge and fast deaths/respawns may be missed.
+- The original movement and hazard algorithms are not rewritten.
+- Not run or validated inside Roblox; no claim of deathless runs.
+- Review third-party code before executing it.
