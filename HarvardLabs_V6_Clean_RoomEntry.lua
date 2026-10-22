@@ -165741,7 +165741,7 @@ do
     local sensedRoots, sensorAt = {}, -math.huge
     local forcedLook = false
     local savedAutoRotate = true
-    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-22-wall-progress-wait-resume" }
+    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-22-opening-clearance-wait-guard" }
     local motionSignal = runService.RenderStepped or runService.Heartbeat
     context.V6RoomEntry.connection = (motionSignal):Connect(function()
         context.V6RoomEntry.frames = (context.V6RoomEntry.frames or 0) + 1
@@ -165959,7 +165959,7 @@ do
         -- A wide lane may take more than half a second to leave at speed 22.
         -- Use one horizon for validation, escape scoring and retreat checks.
         local routeSamples = {0.03, 0.07, 0.12, 0.20, 0.32, 0.52, 0.75, 1.0, 1.25}
-        local function enemyDistance(point)
+        local function enemyDistance(point, lead)
             local closest = math.huge
             for _, enemy in ipairs(nearbyEnemies) do
                 local ex, ez = enemy.x, enemy.z
@@ -165967,6 +165967,12 @@ do
                     ex, ez = enemy.root.Position.X, enemy.root.Position.Z
                 end
                 if type(ex) == "number" and type(ez) == "number" then
+                    if lead and lead > 0 then
+                        local velocity = enemy.root and enemy.root.AssemblyLinearVelocity
+                        local vx = velocity and velocity.X or tonumber(enemy.vx) or 0
+                        local vz = velocity and velocity.Z or tonumber(enemy.vz) or 0
+                        ex, ez = ex + vx * lead, ez + vz * lead
+                    end
                     local dx, dz = point.X - ex, point.Z - ez
                     closest = math.min(closest, math.sqrt(dx * dx + dz * dz))
                 end
@@ -165977,14 +165983,17 @@ do
             if not candidate or candidate.Magnitude <= 0.01 then return false end
             candidate = candidate.Unit
             local origin = root.Position + Vector3.new(0, 1.5, 0)
-            local castOk, hit = pcall(function()
-                return (context.Workspace or workspace):Raycast(
-                    origin,
-                    candidate * math.max(8, math.min(13, humanoid.WalkSpeed * 0.60)),
-                    rayParams
-                )
-            end)
-            if not castOk or hit then return false end
+            local side = Vector3.new(-candidate.Z, 0, candidate.X)
+            local reach = math.max(8, math.min(13, humanoid.WalkSpeed * 0.60))
+            -- A centre ray can clear a corner while the avatar's shoulder
+            -- still collides with it. Require a body-width corridor.
+            for _, offset in ipairs({0, -1.5, 1.5}) do
+                local castOk, hit = pcall(function()
+                    return (context.Workspace or workspace):Raycast(
+                        origin + side * offset, candidate * reach, rayParams)
+                end)
+                if not castOk or hit then return false end
+            end
             if requireHazardSafe and context.dangerAt then
                 for _, travelLead in ipairs(routeSamples) do
                     local point = root.Position
@@ -166191,12 +166200,17 @@ do
                 if not hardUnsafe and score < bestScore then best, bestScore = candidate, score end
             end
             if bestScore == math.huge then
-                local canWait = not orbTooClose and enemyDistance(root.Position) >= 12
-                for _, lead in ipairs({0, pingLead, 0.52 + pingLead, 1.25 + pingLead}) do
+                -- Waiting is valid only if the whole stationary interval
+                -- remains clear of both attacks and approaching enemies.
+                local canWait = not orbTooClose and not enemyTooClose
+                    and enemyDistance(root.Position) >= 38
+                for index = 0, math.ceil((1.25 + pingLead) / 0.05) do
                     if not canWait then break end
+                    local lead = index * 0.05
                     local ok, risk = pcall(context.dangerAt,
                         root.Position.X, root.Position.Y, root.Position.Z, lead)
                     canWait = ok and type(risk) == "number" and risk < riskLimit
+                        and enemyDistance(root.Position, lead) >= 38
                 end
                 if canWait then
                     committedDir, commitUntil, routeDir = nil, 0, nil
