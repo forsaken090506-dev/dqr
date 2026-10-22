@@ -165764,6 +165764,7 @@ do
     local routeDir = nil
     local failedHeadings = {}
     local lastCommandDir = nil
+    local lastOwnedAt = -math.huge
     local failedThisFrame = false
     local function failedHeading(direction, now)
         if not direction or direction.Magnitude < 0.01 then return false end
@@ -165785,7 +165786,7 @@ do
     local sensedRoots, sensorAt = {}, -math.huge
     local forcedLook = false
     local savedAutoRotate = true
-    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-22-overlap-and-persistent-speed" }
+    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-22-escape-continuity" }
     -- Run after render/player input and immediately before physical movement.
     local motionSignal = runService.PreSimulation or runService.RenderStepped or runService.Heartbeat
     _G.HL_V6_CONTROLLER_REPORT = context.V6RoomEntry
@@ -165799,7 +165800,7 @@ do
         if character ~= lastCharacter then
             lastCharacter, idleAt, routeDir = character, os.clock(), nil
             sensedRoots, sensorAt = {}, -math.huge
-            failedHeadings, lastCommandDir = {}, nil
+            failedHeadings, lastCommandDir, lastOwnedAt = {}, nil, -math.huge
             committedDir, commitUntil = nil, 0
             progressPos, progressAt = root.Position, os.clock()
             rayParams = RaycastParams.new()
@@ -165835,6 +165836,7 @@ do
                 stalledFor = now - progressAt,
             }
             report.lastDecision = reason
+            lastOwnedAt = now
             humanoid:Move(direction, false)
         end
         failedThisFrame = false
@@ -166119,20 +166121,16 @@ do
         end
         local stalled = failedThisFrame or now - progressAt >= 0.25
         local wasWaiting = context.V6RoomEntry.waiting == true
-        if specializedEscape and not enemyEmergency and not stalled and not wasWaiting
-            and moving and not failedHeading(humanoid.MoveDirection, now)
-            and laneOpen(humanoid.MoveDirection,
-                movementState:sub(1, 7) == "ESCAPE ") then
-            committedDir, commitUntil, routeDir = nil, 0, nil
-            idleAt = now
-            return
-        end
         -- Keep ownership of an established escape lane long enough to clear
         -- the whole telegraph. This prevents the combat controller from
         -- steering back toward the enemies halfway through the dodge.
         if committedDir and now < commitUntil and context.dangerAt then
             local laneSafe = laneOpen(committedDir, false)
             local initialEnemyDistance = enemyDistance(root.Position)
+            local startOk, startRisk = pcall(routeDanger,
+                root.Position.X, root.Position.Y, root.Position.Z, 0)
+            local exiting = startOk and type(startRisk) == "number" and startRisk >= riskLimit
+            local cleared = not exiting
             for _, travelLead in ipairs(routeSamples) do
                 local hazardLead = travelLead + pingLead
                 local probe = root.Position
@@ -166144,13 +166142,24 @@ do
                     probe.Z,
                     travelLead
                 )
-                if not commitOk or type(commitRisk) ~= "number" or commitRisk >= riskLimit
+                -- An escape may have an unavoidable unsafe prefix. Keep it
+                -- only if risk does not increase, it reaches clear space,
+                -- and never enters another attack after clearing the first.
+                local hazardSafe = commitOk and type(commitRisk) == "number"
+                if hazardSafe then
+                    if commitRisk < riskLimit then
+                        cleared = true
+                    elseif cleared or not exiting or commitRisk > startRisk + 0.01 then
+                        hazardSafe = false
+                    end
+                end
+                if not hazardSafe
                     or enemyDistance(probe, hazardLead) < math.min(38, initialEnemyDistance) - 1 then
                     laneSafe = false
                     break
                 end
             end
-            if laneSafe then
+            if laneSafe and cleared then
                 routeDir = committedDir
                 lastCommandDir = routeDir
                 applyCommand(routeDir, "move: final escape")
@@ -166158,6 +166167,16 @@ do
             end
             committedDir, commitUntil, routeDir = nil, 0, nil
             lastScanAt = -math.huge
+        end
+        if specializedEscape and not enemyEmergency and not stalled and not wasWaiting
+            and moving and not failedHeading(humanoid.MoveDirection, now)
+            and (not lastCommandDir or now - lastOwnedAt > 0.75
+                or humanoid.MoveDirection.Unit:Dot(lastCommandDir) >= 0)
+            and laneOpen(humanoid.MoveDirection,
+                movementState:sub(1, 7) == "ESCAPE ") then
+            committedDir, commitUntil, routeDir = nil, 0, nil
+            idleAt = now
+            return
         end
         -- Do not compete with the game's normal movement controller while it
         -- is already carrying us through a safe lane. The watchdog only takes
@@ -166185,7 +166204,9 @@ do
             local forwardSafe = quickOk and type(quickRisk) == "number" and quickRisk < riskLimit
             if currentSafe and forwardSafe and not enemyTooClose and not orbTooClose
                 and not stalled and not wasWaiting and not failedHeading(heading, now)
-                and laneOpen(heading, false) then
+                and laneOpen(heading, false)
+                and (not lastCommandDir or now - lastOwnedAt > 0.75
+                    or heading:Dot(lastCommandDir) >= 0) then
                 return
             end
         end
@@ -166228,6 +166249,12 @@ do
                     basis.X * s + basis.Z * c
                 )
                 local score = failedHeading(candidate, now) and 25000 or 0
+                -- Safety exclusions still dominate. Among viable lanes,
+                -- avoid shuttling back toward the spot just escaped.
+                if lastCommandDir and now - lastOwnedAt <= 0.75 then
+                    local turn = 1 - math.clamp(candidate:Dot(lastCommandDir), -1, 1)
+                    score = score + turn * turn * 15
+                end
                 local hardUnsafe = false
                 local lastUnsafe = 0
                 local physicalOpen = laneOpen(candidate, false)
