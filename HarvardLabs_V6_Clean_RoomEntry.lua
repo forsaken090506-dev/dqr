@@ -165709,6 +165709,11 @@ print(string.format("[HL V4] %d stages initialized in %.1f ms", #startupReport.s
 -- character's facing to leave the entrance. It never runs while dead,
 -- destroyed, or during an active escape command.
 do
+    -- Component-local service variables are not in scope here. Bind the
+    -- initialized dependencies explicitly before attaching the controller.
+    local runService = assert(context.RunService, "V6: missing RunService")
+    local localPlayer = assert(context.LocalPlayer, "V6: missing LocalPlayer")
+    local players = assert(context.Players, "V6: missing Players")
     local idleAt = 0
     local lastScanAt = 0
     local lastCharacter = nil
@@ -165721,9 +165726,10 @@ do
     local sensedRoots, sensorAt = {}, -math.huge
     local forcedLook = false
     local savedAutoRotate = true
-    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-22-mob-lane-horizon" }
+    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-22-controller-scope-safe-field" }
     local motionSignal = runService.RenderStepped or runService.Heartbeat
-    ;(motionSignal):Connect(function()
+    context.V6RoomEntry.connection = (motionSignal):Connect(function()
+        context.V6RoomEntry.frames = (context.V6RoomEntry.frames or 0) + 1
         if context.RT.destroyed or not context.RT.farmEnabled then return end
         local character = localPlayer.Character
         local humanoid = character and character:FindFirstChildOfClass("Humanoid")
@@ -165842,9 +165848,9 @@ do
         -- selected refuge because it happens to be near the boss.
         local safeField = context.RD and context.RD.safeField
         local safeSpots = safeField and safeField.gsSpots
-        local safeFieldActive = archpriestActive
-            and safeField
-            and safeSpots
+        local safeFieldActive = safeField
+            and (archpriestActive or safeField.name == "archpriestsafezones")
+            and type(safeSpots) == "table"
             and #safeSpots > 0
             and now >= (safeField.from or now) - 2.5
             and now <= (safeField.untilAt or now) + 0.35
