@@ -59146,6 +59146,26 @@ components.movementCombat = function(context)
     end
     local function releaseMover(humanoid, argument)
         local value = {}
+        -- Releasing a refuge route must actually stop it. The generic
+        -- release fallbacks below may start a spike/trail/no-still dodge,
+        -- even while the caller reports "standing in it".
+        local refuge = capturedContext[3].safeField
+        if humanoid and argument and refuge and refuge.name == "archpriestsafezones"
+            and os.clock() <= (refuge.untilAt or 0) then
+            for _, spot in ipairs(refuge.gsSpots or capturedContext[3].safeSpots or {}) do
+                local dx, dz = argument.Position.X - spot.x, argument.Position.Z - spot.z
+                local insetRadius = math.max((spot.r or 0) - (capturedContext[1].gsSafeEdge or 1), 2)
+                if dx * dx + dz * dz <= insetRadius * insetRadius then
+                    movement.cmdDir = nil
+                    movement.cmdAt = capturedContext[2].brainNow
+                    movement.driving = false
+                    movement.stallSince, movement.lastPos, movement.progPos = nil, nil, nil
+                    movementBoost.steer(nil)
+                    humanoid:Move(Vector3.zero, false)
+                    return
+                end
+            end
+        end
         if humanoid then
             if argument then
                 if context.spikeWayStand then
