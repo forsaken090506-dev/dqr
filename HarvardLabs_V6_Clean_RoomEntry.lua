@@ -7970,7 +7970,7 @@ end
 components.movementBoost = function(context)
     local config, runtimeState = context.CFG, context.RT
     local localPlayer, config2 =
-        context.LocalPlayer, { TargetSpeed = 20, MinSpeed = 18, MaxSpeed = 22, FallbackSpeed = 18 }
+        context.LocalPlayer, { TargetSpeed = 25, MinSpeed = 25, MaxSpeed = 27, FallbackSpeed = 25 }
     local sharedValue = localPlayer.Character
     local sharedValue2, sharedValue3, sharedValue4, moverHeading =
         sharedValue and (sharedValue:FindFirstChildOfClass("Humanoid")), false
@@ -8032,7 +8032,9 @@ components.movementBoost = function(context)
         runtimeState.locomotionSpeed = nil
         if helper() then
             local humanoid = sharedValue2
-            humanoid.WalkSpeed = sharedValue4 or config2.FallbackSpeed
+            humanoid.WalkSpeed = runtimeState.farmEnabled
+                and (context.speedNormal and context.speedNormal() or config2.FallbackSpeed)
+                or sharedValue4 or config2.FallbackSpeed
         end
         sharedValue4 = nil
     end
@@ -51979,6 +51981,7 @@ components.movementCombat = function(context)
         end
     end
     local function buffSeen()
+        capturedContext[2].speedSpellLatched = nil
         movement.controlsOff = false
         movement.controlsAt = 0
         movement.stallLogged = false
@@ -52003,10 +52006,10 @@ components.movementCombat = function(context)
         return true
     end
     context.speedNormal = function()
-        return 20
+        return capturedContext[2].speedSpellLatched and 27 or 25
     end
     context.speedBurst = function()
-        return 22
+        return 27
     end
     context.speedApply = function()
         local value = {}
@@ -52162,6 +52165,7 @@ components.movementCombat = function(context)
             local walkSpeed2 = context.speedNormal()
             local value4 = context.speedBurst()
             if context.speedAbilityOn(os.clock()) then
+                capturedContext[2].speedSpellLatched = true
                 if not capturedContext[2].speedBuffHeld then
                     if math.abs(humanoid3.WalkSpeed - value4) > 0.01 then
                         if math.abs(humanoid3.WalkSpeed - walkSpeed2) > 0.01 then
@@ -165781,7 +165785,7 @@ do
     local sensedRoots, sensorAt = {}, -math.huge
     local forcedLook = false
     local savedAutoRotate = true
-    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-22-final-movement-owner" }
+    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-22-overlap-and-persistent-speed" }
     -- Run after render/player input and immediately before physical movement.
     local motionSignal = runService.PreSimulation or runService.RenderStepped or runService.Heartbeat
     _G.HL_V6_CONTROLLER_REPORT = context.V6RoomEntry
@@ -165855,6 +165859,21 @@ do
         end
         local pingS = context.RT and (context.RT.pingS or context.RT.dataPingS) or 0
         local pingLead = math.clamp((tonumber(pingS) or 0) + 0.16, 0, 0.60)
+        -- A latency forecast must not erase an attack that is active now
+        -- but expires before the predicted arrival time.
+        local function routeDanger(x, y, z, lead)
+            local live = context.dangerAt(x, y, z, lead)
+            local predicted = context.dangerAt(x, y, z, lead + pingLead)
+            if type(live) ~= "number" or type(predicted) ~= "number" then
+                return math.huge
+            end
+            return math.max(live, predicted)
+        end
+        -- Reapply after native/spell resets, before prediction uses the speed.
+        -- Respect an actual game hold rather than walking out of a stun.
+        if context.speedNormal and humanoid.WalkSpeed > 0 then
+            humanoid.WalkSpeed = math.max(humanoid.WalkSpeed, context.speedNormal())
+        end
         -- Movement auto-rotation was winning the final frame against the
         -- Archpriestess LOOK AWAY controller. That caused the stun visible at
         -- 2:03 in the recording, leaving the avatar unable to clear the orb.
@@ -166085,11 +166104,11 @@ do
                     local point = root.Position
                         + candidate * math.max(humanoid.WalkSpeed, 12) * travelLead
                     local ok, risk = pcall(
-                        context.dangerAt,
+                        routeDanger,
                         point.X,
                         point.Y,
                         point.Z,
-                        travelLead + pingLead
+                        travelLead
                     )
                     if not ok or type(risk) ~= "number" or risk >= riskLimit then
                         return false
@@ -166102,7 +166121,8 @@ do
         local wasWaiting = context.V6RoomEntry.waiting == true
         if specializedEscape and not enemyEmergency and not stalled and not wasWaiting
             and moving and not failedHeading(humanoid.MoveDirection, now)
-            and laneOpen(humanoid.MoveDirection, false) then
+            and laneOpen(humanoid.MoveDirection,
+                movementState:sub(1, 7) == "ESCAPE ") then
             committedDir, commitUntil, routeDir = nil, 0, nil
             idleAt = now
             return
@@ -166118,11 +166138,11 @@ do
                 local probe = root.Position
                     + committedDir * math.max(humanoid.WalkSpeed, 12) * travelLead
                 local commitOk, commitRisk = pcall(
-                    context.dangerAt,
+                    routeDanger,
                     probe.X,
                     probe.Y,
                     probe.Z,
-                    hazardLead
+                    travelLead
                 )
                 if not commitOk or type(commitRisk) ~= "number" or commitRisk >= riskLimit
                     or enemyDistance(probe, hazardLead) < math.min(38, initialEnemyDistance) - 1 then
@@ -166224,11 +166244,11 @@ do
                     local point = root.Position
                         + candidate * math.max(humanoid.WalkSpeed, 12) * travelLead
                     local ok, risk = pcall(
-                        context.dangerAt,
+                        routeDanger,
                         point.X,
                         point.Y,
                         point.Z,
-                        hazardLead
+                        travelLead
                     )
                     if not ok or type(risk) ~= "number" then
                         score = math.huge
@@ -166333,11 +166353,11 @@ do
                 local probe = root.Position
                     + committedDir * math.max(humanoid.WalkSpeed, 12) * travelLead
                 local probeOk, probeRisk = pcall(
-                    context.dangerAt,
+                    routeDanger,
                     probe.X,
                     probe.Y,
                     probe.Z,
-                    hazardLead
+                    travelLead
                 )
                 if probeOk and type(probeRisk) == "number" and probeRisk < riskLimit then
                     best = committedDir
