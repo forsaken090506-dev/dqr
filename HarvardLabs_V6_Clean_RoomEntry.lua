@@ -165636,6 +165636,11 @@ components.interfaceMainLoop = function(context)
         helper233("brain", helper235, value)
         helper233("caster", context.casterTick, value)
         helper233("face", context.faceTick, value)
+        -- The safety arbiter must see the result of every native override,
+        -- including red/orb pushes, instead of racing a separate render loop.
+        if context.v6FinalizeMovement then
+            context.v6FinalizeMovement("post-main")
+        end
         runtimeState.econN = (runtimeState.econN or 0) + 1
         mainLoop = config.lowEndEconomy ~= false
             and (runtimeState.tickMs or 0) > (config.lowEndLoad or 2)
@@ -165776,10 +165781,11 @@ do
     local sensedRoots, sensorAt = {}, -math.huge
     local forcedLook = false
     local savedAutoRotate = true
-    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-22-predictive-pack-clearance" }
-    local motionSignal = runService.RenderStepped or runService.Heartbeat
+    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-22-final-movement-owner" }
+    -- Run after render/player input and immediately before physical movement.
+    local motionSignal = runService.PreSimulation or runService.RenderStepped or runService.Heartbeat
     _G.HL_V6_CONTROLLER_REPORT = context.V6RoomEntry
-    local function controllerTick()
+    local function controllerTick(phase)
         context.V6RoomEntry.frames = (context.V6RoomEntry.frames or 0) + 1
         if context.RT.destroyed or not context.RT.farmEnabled then return end
         local character = localPlayer.Character
@@ -165801,6 +165807,32 @@ do
             forcedLook, savedAutoRotate = false, humanoid.AutoRotate
         end
         local now = os.clock()
+        local report = context.V6RoomEntry
+        report.phase = phase
+        report.nativeState = context.RT.movementState
+        report.position = {x = root.Position.X, z = root.Position.Z}
+        local function applyCommand(direction, reason)
+            -- Keep the native guards' input consistent with the final command.
+            -- Previously only Humanoid.Move changed, leaving MV.cmdDir stale.
+            local native = context.MV
+            local prior = native and native.cmdDir
+            if native then
+                native.cmdDir = direction.Magnitude > 0.01 and direction or nil
+                native.cmdAt = context.RT.brainNow or now
+                native.driving = direction.Magnitude > 0.01
+            end
+            report.trace = report.trace or {}
+            report.traceIndex = (report.traceIndex or 0) % 120 + 1
+            report.trace[report.traceIndex] = {
+                at = now, phase = phase, reason = reason,
+                x = root.Position.X, z = root.Position.Z,
+                nativeX = prior and prior.X, nativeZ = prior and prior.Z,
+                dx = direction.X, dz = direction.Z, speed = humanoid.WalkSpeed,
+                stalledFor = now - progressAt,
+            }
+            report.lastDecision = reason
+            humanoid:Move(direction, false)
+        end
         failedThisFrame = false
         local moving = humanoid.MoveDirection.Magnitude > 0.08
         if moving then idleAt = now end
@@ -165918,7 +165950,8 @@ do
             and now <= (safeField.untilAt or now) + 0.35
         if safeFieldActive then
             context.V6RoomEntry.waiting = false
-            committedDir, commitUntil, routeDir = nil, 0, nil
+            committedDir, commitUntil, routeDir, lastCommandDir = nil, 0, nil, nil
+            report.lastDecision = "yield: green refuge owner"
             idleAt = now
             return
         end
@@ -166100,7 +166133,7 @@ do
             if laneSafe then
                 routeDir = committedDir
                 lastCommandDir = routeDir
-                humanoid:Move(routeDir, false)
+                applyCommand(routeDir, "move: final escape")
                 return
             end
             committedDir, commitUntil, routeDir = nil, 0, nil
@@ -166143,7 +166176,7 @@ do
         if now - lastScanAt < 0.010 and not stalled and not wasWaiting then
             if routeDir and routeDir.Magnitude > 0.01 then
                 lastCommandDir = routeDir
-                humanoid:Move(routeDir, false)
+                applyCommand(routeDir, "move: final escape")
             end
             return
         end
@@ -166285,7 +166318,7 @@ do
                     context.V6RoomEntry.waiting = true
                     lastCommandDir = nil
                     context.V6RoomEntry.lastDecision = "wait: stationary interval checked"
-                    humanoid:Move(Vector3.zero, false)
+                    applyCommand(Vector3.zero, "wait: checked stationary interval")
                     return -- no cooldown: re-score every frame until a route opens
                 end
                 best = fallback
@@ -166355,14 +166388,14 @@ do
             end
             lastCommandDir = routeDir
             context.V6RoomEntry.lastDecision = "move: selected escape heading"
-            humanoid:Move(routeDir, false)
+            applyCommand(routeDir, "move: final escape")
             idleAt = os.clock()
             context.V6RoomEntry.kicks = context.V6RoomEntry.kicks + 1
             context.V6RoomEntry.last = {at = os.clock(), x = routeDir.X, z = routeDir.Z}
         end
     end
-    context.V6RoomEntry.connection = (motionSignal):Connect(function()
-        local ok, err = pcall(controllerTick)
+    context.v6FinalizeMovement = function(phase)
+        local ok, err = pcall(controllerTick, phase)
         if not ok then
             local report = context.V6RoomEntry
             report.errors = (report.errors or 0) + 1
@@ -166372,6 +166405,9 @@ do
                 warn("[HL V6 controller] " .. report.lastError)
             end
         end
+    end
+    context.V6RoomEntry.connection = motionSignal:Connect(function()
+        context.v6FinalizeMovement("pre-physics")
     end)
 end
 return context
