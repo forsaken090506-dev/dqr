@@ -165706,7 +165706,7 @@ do
     local progressPos = nil
     local progressAt = 0
     local rayParams = nil
-    context.V6RoomEntry = { kicks = 0, last = nil }
+    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-22-1719" }
     local motionSignal = runService.RenderStepped or runService.Heartbeat
     ;(motionSignal):Connect(function()
         if context.RT.destroyed or not context.RT.farmEnabled then return end
@@ -165734,7 +165734,28 @@ do
             committedDir, commitUntil = nil, 0
         end
         local pingS = context.RT and (context.RT.pingS or context.RT.dataPingS) or 0
-        local pingLead = math.clamp((tonumber(pingS) or 0) + 0.03, 0, 0.40)
+        local pingLead = math.clamp((tonumber(pingS) or 0) + 0.10, 0, 0.48)
+        -- Do not wait for the first telegraph after the combat mover has
+        -- already entered the pack. At that point overlapping beams, circles,
+        -- and melee attacks can cover every first step. Enemy proximity is an
+        -- emergency in its own right, so the watchdog takes ownership early
+        -- and preserves enough space for a real dodge lane.
+        local enemyTooClose = false
+        if context.RD and context.RD.enemies then
+            for _, enemy in ipairs(context.RD.enemies) do
+                local ex, ez = enemy.x, enemy.z
+                if enemy.root and enemy.root.Parent then
+                    ex, ez = enemy.root.Position.X, enemy.root.Position.Z
+                end
+                if type(ex) == "number" and type(ez) == "number" then
+                    local dx, dz = root.Position.X - ex, root.Position.Z - ez
+                    if dx * dx + dz * dz < 34 * 34 then
+                        enemyTooClose = true
+                        break
+                    end
+                end
+            end
+        end
         local function laneOpen(candidate, requireHazardSafe)
             if not candidate or candidate.Magnitude <= 0.01 then return false end
             candidate = candidate.Unit
@@ -165817,7 +165838,7 @@ do
             )
             local currentSafe = currentOk and type(currentRisk) == "number" and currentRisk < 0.35
             local forwardSafe = quickOk and type(quickRisk) == "number" and quickRisk < 0.35
-            if currentSafe and forwardSafe then
+            if currentSafe and forwardSafe and not enemyTooClose then
                 return
             end
         end
@@ -165901,8 +165922,8 @@ do
                                 -- Keep a wide buffer around every live enemy;
                                 -- a route that clears a hazard but enters melee
                                 -- range is not a safe route.
-                                if distance < 24 then
-                                    score = score + (24 - distance) * (24 - distance) * 0.55
+                                if distance < 36 then
+                                    score = score + (36 - distance) * (36 - distance) * 1.2
                                 end
                             end
                         end
@@ -165953,8 +165974,8 @@ do
                 if type(ex) == "number" and type(ez) == "number" then
                     local dx, dz = root.Position.X - ex, root.Position.Z - ez
                     local distance = math.sqrt(dx * dx + dz * dz)
-                    if distance < 18 then
-                        local weight = math.max(1, 18 - distance)
+                    if distance < 34 then
+                        local weight = math.max(1, 34 - distance)
                         awayX, awayZ = awayX + dx / math.max(distance, 0.1) * weight,
                             awayZ + dz / math.max(distance, 0.1) * weight
                         urgent = true
@@ -165994,7 +166015,7 @@ do
                         end
                     end
                 end
-                if nearestX and nearestD < 20 then
+                if nearestX and nearestD < 34 then
                     local dx, dz = root.Position.X - nearestX, root.Position.Z - nearestZ
                     if math.abs(dx) + math.abs(dz) > 0.01 then
                         local retreat = Vector3.new(dx, 0, dz).Unit
