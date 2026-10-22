@@ -27649,6 +27649,10 @@ components.hazardReader = function(context)
         }
     end
     context.gsLapPoint = function(vector, argument, argument2)
+        -- Archpriestess refuge: settle inside until the field finishes.
+        -- Laps can carry the avatar over the boundary at normal movement speed.
+        local field = hazardReader.safeField
+        if field and field.name == "archpriestsafezones" then return nil end
         if not argument or config.gsSafeLaps == false then
             return nil
         end
@@ -28319,6 +28323,12 @@ components.hazardReader = function(context)
         return nil
     end
     context.gsZPassPoint = function(vector, spot, argument, argument2, argument3, argument4)
+        -- Do not schedule a timed pass out of the first boss's green refuge.
+        -- Returning nil leaves the existing safe-field mover in control.
+        if argument and argument.name == "archpriestsafezones" then
+            runtimeState.gsZP = nil
+            return nil
+        end
         if game.PlaceId ~= 101088859550383 and HLGS ~= true then
             return nil
         elseif config.gsSafeZPass == false then
@@ -28403,6 +28413,11 @@ components.hazardReader = function(context)
     end
     context.gsZPassTail = function(argument, argument2, argument3, argument4)
         local value = runtimeState.gsZP
+        -- Cancel any already-scheduled outward pass as well as new ones.
+        if value and value.sf and value.sf.name == "archpriestsafezones" then
+            runtimeState.gsZP = nil
+            return nil
+        end
         if game.PlaceId ~= 101088859550383 and HLGS ~= true then
             return nil
         elseif config.gsSafeZPass == false then
