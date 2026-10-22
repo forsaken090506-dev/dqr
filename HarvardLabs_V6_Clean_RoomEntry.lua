@@ -165741,7 +165741,7 @@ do
     local sensedRoots, sensorAt = {}, -math.huge
     local forcedLook = false
     local savedAutoRotate = true
-    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-22-controller-scope-safe-field" }
+    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-22-wall-progress-wait-resume" }
     local motionSignal = runService.RenderStepped or runService.Heartbeat
     context.V6RoomEntry.connection = (motionSignal):Connect(function()
         context.V6RoomEntry.frames = (context.V6RoomEntry.frames or 0) + 1
@@ -165870,6 +165870,7 @@ do
             and now >= (safeField.from or now) - 2.5
             and now <= (safeField.untilAt or now) + 0.35
         if safeFieldActive then
+            context.V6RoomEntry.waiting = false
             committedDir, commitUntil, routeDir = nil, 0, nil
             idleAt = now
             return
@@ -165950,56 +165951,6 @@ do
                 end
             end
         end
-        -- A Knight circle is centered on a nearby enemy by design. Its
-        -- geometric rim exit must not be preempted merely by that proximity.
-        -- Validate the fresh complete route, rather than substituting a short
-        -- heading which may never reach the circle boundary.
-        local circleGoal = context.BB and context.BB.goal
-        if type(movementState) == "string" and movementState:sub(1, 8) == "KCIRCLE:"
-            and circleGoal and circleGoal.name == "kcircle rim exit" and circleGoal.p
-            and now - (circleGoal.at or -math.huge) >= 0
-            and now - (circleGoal.at or -math.huge) < 0.25
-            and now - progressAt < 0.25
-            and context.gsLineClear and context.dangerAt then
-            local destination = circleGoal.p
-            local delta = Vector3.new(destination.X - root.Position.X, 0,
-                destination.Z - root.Position.Z)
-            local length = delta.Magnitude
-            local ok, clear = pcall(context.gsLineClear, root.Position, destination)
-            local safe = ok and clear == true and length > 0.5
-            local exited = false
-            local speed = math.max(humanoid.WalkSpeed, 12)
-            local steps = math.clamp(math.ceil(length / 1.5), 1, 80)
-            for index = 1, steps + 1 do
-                if not safe then break end
-                local fraction = math.min(index / steps, 1)
-                local probe = root.Position + delta * fraction
-                local lead = length * fraction / speed + pingLead
-                    + (index > steps and 0.25 or 0)
-                local riskOk, risk = pcall(context.dangerAt, probe.X, probe.Y, probe.Z, lead)
-                if not riskOk or type(risk) ~= "number" then
-                    safe = false
-                elseif risk < (enemyEmergency and 0.12 or 0.24) then
-                    exited = true
-                elseif exited or index >= steps then
-                    -- Starting inside the circle is unavoidable; entering
-                    -- another attack after clearing it is not a valid exit.
-                    safe = false
-                end
-            end
-            if safe and exited then
-                committedDir, commitUntil, routeDir = nil, 0, nil
-                idleAt = now
-                context.V6RoomEntry.circleRouteHeld =
-                    (context.V6RoomEntry.circleRouteHeld or 0) + 1
-                return -- native circle mover retains the checked rim target
-            end
-        end
-        if specializedEscape and not enemyEmergency then
-            committedDir, commitUntil, routeDir = nil, 0, nil
-            idleAt = now
-            return
-        end
         -- The built-in hardcore profile starts moving at 0.12 danger. The old
         -- watchdog waited for 0.35, which explains the visible late first step
         -- on close red lanes. Match that sensitivity at point-blank range while
@@ -166051,6 +166002,14 @@ do
                 end
             end
             return true
+        end
+        local stalled = now - progressAt >= 0.25
+        local wasWaiting = context.V6RoomEntry.waiting == true
+        if specializedEscape and not enemyEmergency and not stalled and not wasWaiting
+            and moving and laneOpen(humanoid.MoveDirection, false) then
+            committedDir, commitUntil, routeDir = nil, 0, nil
+            idleAt = now
+            return
         end
         -- Keep ownership of an established escape lane long enough to clear
         -- the whole telegraph. This prevents the combat controller from
@@ -166107,7 +166066,8 @@ do
             )
             local currentSafe = currentOk and type(currentRisk) == "number" and currentRisk < riskLimit
             local forwardSafe = quickOk and type(quickRisk) == "number" and quickRisk < riskLimit
-            if currentSafe and forwardSafe and not enemyTooClose and not orbTooClose then
+            if currentSafe and forwardSafe and not enemyTooClose and not orbTooClose
+                and not stalled and not wasWaiting and laneOpen(heading, false) then
                 return
             end
         end
@@ -166115,7 +166075,7 @@ do
         -- replaying the last safe heading between scans. Refresh at roughly
         -- one frame while using a compact prediction horizon so the dodge
         -- reacts quickly without blocking the render step.
-        if now - lastScanAt < 0.010 then
+        if now - lastScanAt < 0.010 and not stalled and not wasWaiting then
             if routeDir and routeDir.Magnitude > 0.01 then
                 humanoid:Move(routeDir, false)
             end
@@ -166231,6 +166191,19 @@ do
                 if not hardUnsafe and score < bestScore then best, bestScore = candidate, score end
             end
             if bestScore == math.huge then
+                local canWait = not orbTooClose and enemyDistance(root.Position) >= 12
+                for _, lead in ipairs({0, pingLead, 0.52 + pingLead, 1.25 + pingLead}) do
+                    if not canWait then break end
+                    local ok, risk = pcall(context.dangerAt,
+                        root.Position.X, root.Position.Y, root.Position.Z, lead)
+                    canWait = ok and type(risk) == "number" and risk < riskLimit
+                end
+                if canWait then
+                    committedDir, commitUntil, routeDir = nil, 0, nil
+                    context.V6RoomEntry.waiting = true
+                    humanoid:Move(Vector3.zero, false)
+                    return -- no cooldown: re-score every frame until a route opens
+                end
                 best = fallback
                 context.V6RoomEntry.fallbackExit = fallbackExit
             end
@@ -166290,6 +166263,7 @@ do
             return -- leave existing wall recovery in control
         end
         if dir.Magnitude > 0.01 then
+            context.V6RoomEntry.waiting = false
             routeDir = dir.Unit
             if moving then
                 committedDir = routeDir
