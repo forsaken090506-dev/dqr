@@ -1,0 +1,92 @@
+--[[
+    ==============================================================
+    DEOBFUSCATED BY @notninjaa3530 (Discord)
+    ==============================================================
+--]]
+local players = game:GetService("Players")
+local player = players.LocalPlayer
+while not player do
+    task.wait()
+    player = players.LocalPlayer
+end
+local serviceCache = {}
+local function getService(name)
+    local service = serviceCache[name]
+    if not service then
+        service = game:GetService(name)
+        if type(cloneref) == "function" then
+            service = cloneref(service)
+        end
+        serviceCache[name] = service
+    end
+    return service
+end
+local argumentHelpers = { [108] = table.pack, [66] = unpack, [58] = table.move }
+argumentHelpers.unpackValues = function(helpers, values)
+    return helpers[66](values, 1, values.n)
+end
+argumentHelpers.appendValues = function(helpers, destination, offset, ...)
+    local packedValues = helpers[108](...)
+    helpers[58](packedValues, 1, packedValues.n, offset + 1, destination)
+end
+argumentHelpers.appendPackedValues = function(_helpers, destination, offset, values)
+    for index = 1, values.n, 1 do
+        destination[offset + index] = values[index]
+    end
+    destination.n = offset + values.n
+end
+local components = {}
+components.coreSettings = function(context)
+    context.DEV = false
+    if context.DEV then
+        if getgenv ~= nil then
+            pcall(function()
+                getgenv().HL_S = context
+            end)
+        end
+    end
+    context.NOVIS = not context.DEV
+    if not (game:IsLoaded()) then
+        game.Loaded:Wait()
+    end
+    if type(_G.DungeonAutofarmDestruct) == "function" then
+        local success, sharedValue = pcall(_G.DungeonAutofarmDestruct)
+        if not success then
+            warn("[DQ] could not stop the previous copy: " .. tostring(sharedValue))
+        end
+        task.wait(0.1)
+    end
+    local players = getService("Players")
+    local localPlayer = players.LocalPlayer
+    while not localPlayer do
+        task.wait(0.1)
+        localPlayer = players.LocalPlayer
+    end
+    local sharedValue2 = game:GetService("Workspace")
+    local runService, replicatedStorage, userInputService, pathfindingService, virtualInputManager, httpService =
+        getService("RunService"),
+        getService("ReplicatedStorage"),
+        getService("UserInputService"),
+        getService("PathfindingService"),
+        getService("VirtualInputManager"),
+        getService("HttpService")
+    if _G.DungeonAutofarmDestruct then
+        pcall(_G.DungeonAutofarmDestruct)
+    end
+    _G.DungeonAutofarmVersion = "v3.0 c84b"
+    local burstMin, burstMaxSpeed = 18, 28
+    local config = {
+        tweenWalk = 16,
+        tweenEscape = 26,
+        burstMin = burstMin,
+        burstMax = burstMaxSpeed,
+        burstMargin = 1.15,
+        boostMaxRun = 1.5,
+        boostRest = 1.2,
+        boostUrgentRun = 2.5,
+        boostUrgentRest = 0.8,
+        boostDrain = 8,
+        boostDebtMax = 12,
+        boostDebtStart = 3,
+        boostRestMin = 0.4,
+        tweenSlam = burstMaxSpeed,
