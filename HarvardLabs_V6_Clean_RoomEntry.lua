@@ -165756,7 +165756,7 @@ do
     local sensedRoots, sensorAt = {}, -math.huge
     local forcedLook = false
     local savedAutoRotate = true
-    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-22-failed-heading-recovery" }
+    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-22-predictive-pack-clearance" }
     local motionSignal = runService.RenderStepped or runService.Heartbeat
     _G.HL_V6_CONTROLLER_REPORT = context.V6RoomEntry
     local function controllerTick()
@@ -165972,7 +165972,13 @@ do
                 end
                 if type(ex) == "number" and type(ez) == "number" then
                     local dx, dz = root.Position.X - ex, root.Position.Z - ez
-                    local distance2 = dx * dx + dz * dz
+                    local velocity = enemy.root and enemy.root.AssemblyLinearVelocity
+                    local vx = velocity and velocity.X or tonumber(enemy.vx) or 0
+                    local vz = velocity and velocity.Z or tonumber(enemy.vz) or 0
+                    local approachLead = pingLead + 0.60
+                    local predictedDx, predictedDz = dx - vx * approachLead, dz - vz * approachLead
+                    local distance2 = math.min(dx * dx + dz * dz,
+                        predictedDx * predictedDx + predictedDz * predictedDz)
                     if distance2 < 38 * 38 then enemyTooClose = true end
                     if distance2 < 30 * 30 then enemyEmergency = true end
                 end
@@ -166066,7 +166072,7 @@ do
                     hazardLead
                 )
                 if not commitOk or type(commitRisk) ~= "number" or commitRisk >= riskLimit
-                    or enemyDistance(probe) < math.min(38, initialEnemyDistance) - 1 then
+                    or enemyDistance(probe, hazardLead) < math.min(38, initialEnemyDistance) - 1 then
                     laneSafe = false
                     break
                 end
@@ -166202,8 +166208,19 @@ do
                                 ex, ez = enemy.root.Position.X, enemy.root.Position.Z
                             end
                             if type(ex) == "number" and type(ez) == "number" then
+                                local velocity = enemy.root and enemy.root.AssemblyLinearVelocity
+                                local vx = velocity and velocity.X or tonumber(enemy.vx) or 0
+                                local vz = velocity and velocity.Z or tonumber(enemy.vz) or 0
+                                ex, ez = ex + vx * hazardLead, ez + vz * hazardLead
                                 local dx, dz = point.X - ex, point.Z - ez
                                 local distance = math.sqrt(dx * dx + dz * dz)
+                                -- Reject lanes intercepted by the incoming pack.
+                                -- If already cornered, retain the earliest-exit
+                                -- fallback rather than disabling movement.
+                                if distance < math.min(30, enemyDistance(root.Position)) - 1 then
+                                    hardUnsafe = true
+                                    lastUnsafe = travelLead
+                                end
                                 -- Keep a wide buffer around every live enemy;
                                 -- a route that clears a hazard but enters melee
                                 -- range is not a safe route.
