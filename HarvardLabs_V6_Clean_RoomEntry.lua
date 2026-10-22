@@ -165706,7 +165706,9 @@ do
     local progressPos = nil
     local progressAt = 0
     local rayParams = nil
-    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-22-1719" }
+    local forcedLook = false
+    local savedAutoRotate = true
+    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-22-1723" }
     local motionSignal = runService.RenderStepped or runService.Heartbeat
     ;(motionSignal):Connect(function()
         if context.RT.destroyed or not context.RT.farmEnabled then return end
@@ -165721,6 +165723,7 @@ do
             rayParams = RaycastParams.new()
             rayParams.FilterType = Enum.RaycastFilterType.Exclude
             rayParams.FilterDescendantsInstances = {character}
+            forcedLook, savedAutoRotate = false, humanoid.AutoRotate
         end
         local now = os.clock()
         local moving = humanoid.MoveDirection.Magnitude > 0.08
@@ -165735,6 +165738,71 @@ do
         end
         local pingS = context.RT and (context.RT.pingS or context.RT.dataPingS) or 0
         local pingLead = math.clamp((tonumber(pingS) or 0) + 0.10, 0, 0.48)
+        -- Movement auto-rotation was winning the final frame against the
+        -- Archpriestess LOOK AWAY controller. That caused the stun visible at
+        -- 2:03 in the recording, leaving the avatar unable to clear the orb.
+        -- Apply the required facing after movement and hold it for the whole
+        -- warning without changing the avatar's position.
+        local lookPoint = nil
+        if type(context.gsLookPoint) == "function" then
+            local ok, point = pcall(context.gsLookPoint, root.Position)
+            if ok then lookPoint = point end
+        end
+        if not lookPoint and context.RT and context.RT.gsLookSince
+            and context.RT.gsLook and context.RT.gsLook.src then
+            local src = context.RT.gsLook.src
+            local dx, dz = root.Position.X - src.X, root.Position.Z - src.Z
+            if context.RT.gsLook.toward then dx, dz = -dx, -dz end
+            local length = math.sqrt(dx * dx + dz * dz)
+            if length > 0.01 then
+                lookPoint = root.Position + Vector3.new(dx / length * 20, 0, dz / length * 20)
+            end
+        end
+        if lookPoint then
+            if not forcedLook then savedAutoRotate = humanoid.AutoRotate end
+            forcedLook = true
+            humanoid.AutoRotate = false
+            local flatLook = Vector3.new(lookPoint.X, root.Position.Y, lookPoint.Z)
+            if (flatLook - root.Position).Magnitude > 0.01 then
+                root.CFrame = CFrame.lookAt(root.Position, flatLook)
+            end
+        elseif forcedLook then
+            forcedLook = false
+            humanoid.AutoRotate = savedAutoRotate
+        end
+        -- Track the large Archpriestess orb directly from scene geometry.
+        -- Its collision can arrive before the generic hazard list refreshes,
+        -- especially at the 320-340 ms ping shown in the recording.
+        local orbPos, orbVel, orbRadius, orbClearance = nil, Vector3.zero, 0, math.huge
+        if context.Workspace and context.Workspace.GetPartBoundsInRadius then
+            local ok, parts = pcall(function()
+                return context.Workspace:GetPartBoundsInRadius(root.Position, 70)
+            end)
+            if ok and parts then
+                for _, part in ipairs(parts) do
+                    if part:IsA("BasePart") and part:IsDescendantOf(context.Workspace) then
+                        local size = part.Size
+                        local minSize = math.min(size.X, size.Y, size.Z)
+                        local maxSize = math.max(size.X, size.Y, size.Z)
+                        local colour = part.Color
+                        local name = string.lower(part.Name)
+                        local orbLike = name:find("orb", 1, true)
+                            or name:find("sphere", 1, true)
+                            or name:find("projectile", 1, true)
+                        local magenta = colour.R > 0.72 and colour.B > 0.72 and colour.G < 0.82
+                        if minSize >= 4.5 and maxSize >= 7 and (magenta or orbLike) then
+                            local radius = maxSize * 0.5
+                            local distance = (root.Position - part.Position).Magnitude - radius
+                            if distance < orbClearance then
+                                orbPos, orbVel, orbRadius, orbClearance =
+                                    part.Position, part.AssemblyLinearVelocity, radius, distance
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        local orbTooClose = orbPos ~= nil and orbClearance < 34
         -- Do not wait for the first telegraph after the combat mover has
         -- already entered the pack. At that point overlapping beams, circles,
         -- and melee attacks can cover every first step. Enemy proximity is an
@@ -165838,7 +165906,7 @@ do
             )
             local currentSafe = currentOk and type(currentRisk) == "number" and currentRisk < 0.35
             local forwardSafe = quickOk and type(quickRisk) == "number" and quickRisk < 0.35
-            if currentSafe and forwardSafe and not enemyTooClose then
+            if currentSafe and forwardSafe and not enemyTooClose and not orbTooClose then
                 return
             end
         end
@@ -165905,6 +165973,16 @@ do
                         break
                     end
                     score = score + math.max(0, risk) * (1.2 - hazardLead * 0.5)
+                    if orbPos then
+                        local futureOrb = orbPos + orbVel * hazardLead
+                        local clearance = (point - futureOrb).Magnitude - orbRadius
+                        if clearance < 12 then
+                            hardUnsafe = true
+                            score = score + 2000 + (12 - clearance) * 100
+                        elseif clearance < 34 then
+                            score = score + (34 - clearance) * (34 - clearance) * 3
+                        end
+                    end
                     -- A live floor telegraph is a hard exclusion. Keep a
                     -- least-risk fallback for the rare case where every
                     -- heading is blocked, but never prefer a blocked lane
