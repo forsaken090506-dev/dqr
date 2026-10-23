@@ -94829,12 +94829,16 @@ components.movementCombat = function(context)
                         dangerAt(point.X, point.Y, point.Z, 0, nil, nil, skip, true),
                         dangerAt(point.X, point.Y, point.Z, lead + 0.2, nil, nil, skip, true)) * 100
                 end
-                local impact, exit = context.projectileImpact(root.Position, direction, speed, distance / speed)
-                if impact < math.huge then score = score + 10000 / (impact + 0.05) + math.min(exit, 10) * 100 end
+                -- Incoming projectiles are a hard exclusion, including in
+                -- least-exposure mode. Look past the short steering step.
+                local impact = context.projectileImpact(root.Position, direction, speed, 1.25)
+                if impact < math.huge then score = math.huge end
                 if target then
                     score = score + Vector3.new(target.X - endpoint.X, 0, target.Z - endpoint.Z).Magnitude
                 end
-                if not bestScore or score < bestScore then best, bestScore = direction, score end
+                if score < math.huge and (not bestScore or score < bestScore) then
+                    best, bestScore = direction, score
+                end
             end
         end
         return best
@@ -94958,7 +94962,7 @@ components.movementCombat = function(context)
             local ex, ez = endpoint.X - spot.x, endpoint.Z - spot.z
             if ex * ex + ez * ez > inset * inset then return end
             local impact, exit, actualEntry = context.projectileImpact(root.Position, direction, speed, distance / speed)
-            if impact < math.huge and (actualEntry > 0 or exit > distance / speed) then return end
+            if impact < math.huge then return end
             local side = Vector3.new(-direction.Z, 0, direction.X)
             for _, offset in ipairs({0, -1.5, 1.5}) do
                 if workspaceService:Raycast(root.Position + Vector3.new(0, 1.5, 0) + side * offset,
@@ -166701,7 +166705,7 @@ do
         if committedDir and now < commitUntil and context.dangerAt then
             local hitAt, exitAt, actualEntry = projectileImpact(committedDir)
             local laneSafe = laneOpen(committedDir, false)
-                and (hitAt == math.huge or actualEntry == 0 and exitAt <= 0.2)
+                and hitAt == math.huge
             local initialEnemyDistance = enemyDistance(root.Position)
             local startOk, startRisk = pcall(routeDanger,
                 root.Position.X, root.Position.Y, root.Position.Z, 0)
@@ -166914,7 +166918,7 @@ do
                 -- prefix. Prefer the open lane that clears it earliest; never
                 -- select a wall merely because all hazard scores are large.
                 if physicalOpen and crossesActive then activeBlocked = activeBlocked + 1 end
-                if physicalOpen and not crossesActive and score < math.huge and (
+                if physicalOpen and hitAt == math.huge and not crossesActive and score < math.huge and (
                     lastUnsafe < fallbackExit
                     or lastUnsafe == fallbackExit and score < fallbackScore
                 ) then
@@ -167024,6 +167028,12 @@ do
                 context.V6RoomEntry.waiting = true
                 lastCommandDir = nil
                 applyCommand(Vector3.zero, "wait: active floor blocks all exits")
+            elseif projectileImpact(humanoid.MoveDirection, 1.25) < math.huge then
+                -- No checked dodge survived. Do not leave the rejected
+                -- native command running through the projectile lane.
+                context.V6RoomEntry.waiting = true
+                lastCommandDir = nil
+                applyCommand(Vector3.zero, "wait: projectile blocks unchecked native route")
             end
             return -- recheck waiting each frame; physical wall recovery otherwise stays native
         end
