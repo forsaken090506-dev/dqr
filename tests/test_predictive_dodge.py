@@ -110,6 +110,27 @@ end
     def test_safe_standing_does_not_force_risky_prefix(self):
         self.run_lua('''local p=Planner.new();local e=scene('rows')
  assert(p:escapePrefix(e)==nil);assert(p:step(e).reason=='aligned in checked row opening')''')
+    def test_combat_short_step_when_dwell_prevents_complete_path(self):
+        self.run_lua('''local p=Planner.new();local e=scene();e.combat=true;e.native={x=0,z=0}
+ e.risk=function(x,z,t)return t>.28 and 1 or 0 end
+ local c=p:step(e);assert(c.kind=='move' and p.route.prefix,'paused despite clear moving prefix')''')
+    def test_retry_interval_carries_safe_heading_without_pause(self):
+        self.run_lua('''local p=Planner.new();local e=scene();e.combat=true;e.native={x=0,z=0}
+ e.risk=function(x,z,t)return t>.28 and 1 or 0 end
+ p.nextPlan=1;p.lastMove={x=1,z=0};e.now=.01
+ local c=p:step(e);assert(c.kind=='move' and c.dx>.99,'retry interval inserted stop')''')
+    def test_waypoint_handoff_continues_without_zero_command(self):
+        self.run_lua('''local p=Planner.new();local e=scene();e.combat=true;e.native={x=0,z=0}
+ e.risk=function(x,z,t)return t>.28 and 1 or 0 end
+ local c=p:step(e);assert(c.kind=='move');local dx,dz=c.dx,c.dz
+ e.x=c.target.x;e.z=c.target.z;e.now=.12
+ c=p:step(e);assert(c.kind=='move' and c.dx*dx+c.dz*dz>.99,'arrival paused or reversed')''')
+    def test_safe_row_opening_still_holds_during_combat(self):
+        self.run_lua('''local p=Planner.new();local e=scene('rows');e.combat=true
+ assert(p:step(e).reason=='aligned in checked row opening')''')
+    def test_proactive_motion_does_not_suspend_all_attacks(self):
+        self.run_lua('''local p=Planner.new();local e=scene();e.combat=true;e.native={x=0,z=0}
+ local c=p:step(e);assert(c.kind=='move' and not c.holdAttack)''')
     def test_adapter_compiles(self):
         adapter=(ROOT/'dodge/RobloxAdapter.lua').read_text()
         self.lua.execute('local install=(function()\n'+adapter+'\nend)(); assert(type(install)=="function")')
