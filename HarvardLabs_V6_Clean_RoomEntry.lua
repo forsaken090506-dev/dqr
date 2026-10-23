@@ -94818,7 +94818,7 @@ components.movementCombat = function(context)
             return true
         end
         local inset = math.max((spot.r or 0) - math.max(3, capturedContext[1].gsSafeEdge or 1), 2)
-        local radius = math.max(0.5, math.min((spot.r or 0) * 0.55, inset - 1))
+        local radius = math.max(0.5, math.min((spot.r or 0) * 0.78, inset - 1))
         local angle = math.atan2(root.Position.Z - spot.z, root.Position.X - spot.x)
         local speed = context.speedNormal()
         local ping = math.clamp(tonumber(rt.pingS or rt.dataPingS) or 0, 0, 0.6)
@@ -94877,15 +94877,20 @@ components.movementCombat = function(context)
                 -- current position is clear. Keep a least-exposure movement
                 -- candidate in that case too. Refuge bounds, active-floor
                 -- re-entry, walls and incoming projectiles were checked above.
-                local score = exposure / steps * 100 + preference
+                local score = exposure / steps * 100 + preference + (sign == orbit.sign and 0 or 15)
                 if orbit.direction then score = score + (1 - direction:Dot(orbit.direction)) * 5 end
                 if score < fallbackScore then
                     fallback, fallbackSign, fallbackScore, fallbackPoint = direction, sign, score, point
                 end
             end
             if not cleared or forecastBlocked then return end
-            local score = exposure * 100 + preference + (sign == orbit.sign and 0 or 0.2)
-            if score < bestScore then best, bestSign, bestScore, bestPoint = direction, sign, score, point end
+            local score = exposure / steps * 100 + preference
+            -- Keep the current orbit handedness whenever a fully checked
+            -- route exists. Small risk-score changes must not flip direction.
+            if not best or (sign == orbit.sign and bestSign ~= orbit.sign)
+                or (sign == bestSign and score < bestScore) then
+                best, bestSign, bestScore, bestPoint = direction, sign, score, point
+            end
         end
         -- Retain a checked short arc despite small score changes. Every
         -- frame still rechecks hazards, projectile interception and walls.
@@ -94896,14 +94901,14 @@ components.movementCombat = function(context)
         local retained = best ~= nil
         if not retained then
         for _, sign in ipairs({orbit.sign, -orbit.sign}) do
-            for index, advance in ipairs({0.45, 0.8, 1.2, 1.8}) do
+            for index, advance in ipairs({0.18, 0.3, 0.45, 0.8, 1.2}) do
                 local targetAngle = angle + sign * advance
                 consider(Vector3.new(spot.x + math.cos(targetAngle) * radius, root.Position.Y,
                     spot.z + math.sin(targetAngle) * radius), sign, index * 0.01)
             end
         end
         -- A clear inward chord is preferable to stopping under an attack.
-        consider(Vector3.new(spot.x, root.Position.Y, spot.z), orbit.sign, 0.3)
+        consider(Vector3.new(spot.x, root.Position.Y, spot.z), orbit.sign, 8)
         if not best then
             -- A tracking patch can cover the whole small orbit. Use more
             -- of this refuge's interior, keeping the same inset boundary.
@@ -94928,9 +94933,10 @@ components.movementCombat = function(context)
         humanoid:Move(best or Vector3.zero, false)
         if best then
             orbit.sign, orbit.direction = bestSign, best
-            if not retained then orbit.point, orbit.holdUntil = bestPoint, now + 0.18 end
+            if not retained then orbit.point, orbit.holdUntil = bestPoint, now + 0.35 end
             if underfootFallback then
-                orbit.holdUntil = now -- retry for a fully clear route next frame
+                -- The waypoint is still revalidated each frame; retain its
+                -- heading penalty instead of resetting it after every fallback.
                 setState("SAFE SPOT: circling on least-exposure route inside refuge")
             else
                 setState("SAFE SPOT: circling inside first-boss refuge")
