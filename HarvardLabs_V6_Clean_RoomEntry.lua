@@ -94799,6 +94799,19 @@ components.movementCombat = function(context)
             orbit = {field = field, spot = spot, sign = 1}
             rt.archRefugeOrbit = orbit
         end
+        -- Main-loop and pre-physics passes can see the exact same reader
+        -- snapshot. Reapply its checked command without rescoring it twice.
+        local geometryAt = context.DG and context.DG.now
+        if geometryAt and orbit.geometryAt == geometryAt and orbit.checkedAt
+            and now - orbit.checkedAt < 0.005 and orbit.checkedPos
+            and (root.Position - orbit.checkedPos).Magnitude < 0.1 then
+            movement.cmdDir = orbit.checkedDirection
+            movement.cmdAt = rt.brainNow or now
+            movement.driving = orbit.checkedDirection ~= nil
+            movementBoost.steer(orbit.checkedDirection)
+            humanoid:Move(orbit.checkedDirection or Vector3.zero, false)
+            return true
+        end
         local inset = math.max((spot.r or 0) - math.max(3, capturedContext[1].gsSafeEdge or 1), 2)
         local radius = math.max(0.5, math.min((spot.r or 0) * 0.55, inset - 1))
         local angle = math.atan2(root.Position.Z - spot.z, root.Position.X - spot.x)
@@ -94820,6 +94833,7 @@ components.movementCombat = function(context)
             orbit.rays.RespectCanCollide = true
         end
         local best, bestSign, bestScore, bestPoint = nil, orbit.sign, math.huge, nil
+        local fallback, fallbackSign, fallbackScore, fallbackPoint = nil, orbit.sign, math.huge, nil
         local function consider(point, sign, preference)
             local delta = Vector3.new(point.X - root.Position.X, 0, point.Z - root.Position.Z)
             if delta.Magnitude < 0.2 then return end
@@ -94839,6 +94853,7 @@ components.movementCombat = function(context)
             local cleared = startRisk < 0.12
             local activeCleared = startActive < 0.12
             local exposure = 0
+            local forecastBlocked = false
             local steps = math.max(1, math.ceil(distance / 1.25))
             for index = 1, steps do
                 local travel = distance * index / steps
@@ -94848,11 +94863,21 @@ components.movementCombat = function(context)
                 if risk < 0.12 then
                     cleared = true
                 elseif cleared or risk > startRisk + 0.01 then
-                    return
+                    forecastBlocked = true
                 end
                 exposure = exposure + risk
             end
-            if not cleared then return end
+            if startRisk >= 0.12 then
+                -- Standing in an underfoot/tracking warning guarantees no
+                -- progress. Retain a bounded movement fallback; active-floor
+                -- re-entry, walls and incoming projectiles were rejected above.
+                local score = exposure / steps * 100 + preference
+                if orbit.direction then score = score + (1 - direction:Dot(orbit.direction)) * 5 end
+                if score < fallbackScore then
+                    fallback, fallbackSign, fallbackScore, fallbackPoint = direction, sign, score, point
+                end
+            end
+            if not cleared or forecastBlocked then return end
             local score = exposure * 100 + preference + (sign == orbit.sign and 0 or 0.2)
             if score < bestScore then best, bestSign, bestScore, bestPoint = direction, sign, score, point end
         end
@@ -94873,16 +94898,37 @@ components.movementCombat = function(context)
         end
         -- A clear inward chord is preferable to stopping under an attack.
         consider(Vector3.new(spot.x, root.Position.Y, spot.z), orbit.sign, 0.3)
+        if not best then
+            -- A tracking patch can cover the whole small orbit. Use more
+            -- of this refuge's interior, keeping the same inset boundary.
+            local wideRadius = math.max(0.5, inset - 0.5)
+            for _, sign in ipairs({orbit.sign, -orbit.sign}) do
+                for index, advance in ipairs({1.2, 1.8, 2.2, 2.7, math.pi}) do
+                    local targetAngle = angle + sign * advance
+                    consider(Vector3.new(spot.x + math.cos(targetAngle) * wideRadius, root.Position.Y,
+                        spot.z + math.sin(targetAngle) * wideRadius), sign, 0.4 + index * 0.01)
+                end
+            end
         end
+        end
+        local underfootFallback = not best and fallback ~= nil
+        if underfootFallback then best, bestSign, bestPoint = fallback, fallbackSign, fallbackPoint end
+        orbit.geometryAt, orbit.checkedAt, orbit.checkedPos = geometryAt, now, root.Position
+        orbit.checkedDirection = best
         movement.cmdDir = best
         movement.cmdAt = rt.brainNow or now
         movement.driving = best ~= nil
         movementBoost.steer(best)
         humanoid:Move(best or Vector3.zero, false)
         if best then
-            orbit.sign = bestSign
+            orbit.sign, orbit.direction = bestSign, best
             if not retained then orbit.point, orbit.holdUntil = bestPoint, now + 0.18 end
-            setState("SAFE SPOT: circling inside first-boss refuge")
+            if underfootFallback then
+                orbit.holdUntil = now -- retry for a fully clear route next frame
+                setState("SAFE SPOT: moving clear of underfoot attack inside refuge")
+            else
+                setState("SAFE SPOT: circling inside first-boss refuge")
+            end
         else
             orbit.point, orbit.holdUntil = nil, 0
             setState("SAFE SPOT: waiting inside refuge for a clear circle path")
@@ -166030,7 +166076,7 @@ do
     local sensedRoots, sensorAt = {}, -math.huge
     local forcedLook = false
     local savedAutoRotate = true
-    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-23-projectile-priority-stability" }
+    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-23-underfoot-refuge-motion" }
     -- Run after render/player input and immediately before physical movement.
     local motionSignal = runService.PreSimulation or runService.RenderStepped or runService.Heartbeat
     _G.HL_V6_CONTROLLER_REPORT = context.V6RoomEntry
