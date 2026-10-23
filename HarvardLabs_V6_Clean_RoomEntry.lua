@@ -94867,10 +94867,11 @@ components.movementCombat = function(context)
                 end
                 exposure = exposure + risk
             end
-            if startRisk >= 0.12 then
-                -- Standing in an underfoot/tracking warning guarantees no
-                -- progress. Retain a bounded movement fallback; active-floor
-                -- re-entry, walls and incoming projectiles were rejected above.
+            do
+                -- Forecast warnings can reject every orbit even while the
+                -- current position is clear. Keep a least-exposure movement
+                -- candidate in that case too. Refuge bounds, active-floor
+                -- re-entry, walls and incoming projectiles were checked above.
                 local score = exposure / steps * 100 + preference
                 if orbit.direction then score = score + (1 - direction:Dot(orbit.direction)) * 5 end
                 if score < fallbackScore then
@@ -94925,7 +94926,7 @@ components.movementCombat = function(context)
             if not retained then orbit.point, orbit.holdUntil = bestPoint, now + 0.18 end
             if underfootFallback then
                 orbit.holdUntil = now -- retry for a fully clear route next frame
-                setState("SAFE SPOT: moving clear of underfoot attack inside refuge")
+                setState("SAFE SPOT: circling on least-exposure route inside refuge")
             else
                 setState("SAFE SPOT: circling inside first-boss refuge")
             end
