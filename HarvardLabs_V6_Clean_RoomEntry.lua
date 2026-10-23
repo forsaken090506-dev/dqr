@@ -94797,6 +94797,48 @@ components.movementCombat = function(context)
         end
         return earliest, earliestExit, actualEntry
     end
+    -- Last-resort first-boss motion: hazards affect ranking, while walls
+    -- and the refuge boundary remain hard constraints.
+    context.archMovingFallback = function(humanoid, root, previous, target, spot, field)
+        local speed = context.speedNormal()
+        local distance = math.max(2.2, speed * 0.12)
+        local rays = RaycastParams.new()
+        rays.FilterType = Enum.RaycastFilterType.Exclude
+        rays.FilterDescendantsInstances = {localPlayer.Character}
+        rays.RespectCanCollide = true
+        local inset = spot and math.max((spot.r or 0) - math.max(3, capturedContext[1].gsSafeEdge or 1), 2)
+        local function skip(box) return field and tostring(box.name or "") == tostring(field.name) end
+        local best, bestScore
+        for i = 0, 31 do
+            local angle = i * math.pi / 16
+            local direction = Vector3.new(math.cos(angle), 0, math.sin(angle))
+            local endpoint = root.Position + direction * distance
+            local dx, dz = spot and endpoint.X - spot.x or 0, spot and endpoint.Z - spot.z or 0
+            local open = not spot or dx * dx + dz * dz <= inset * inset
+            local side = Vector3.new(-direction.Z, 0, direction.X)
+            for _, offset in ipairs({0, -1.5, 1.5}) do
+                if open and workspaceService:Raycast(root.Position + Vector3.new(0, 1.5, 0) + side * offset,
+                    direction * distance, rays) then open = false end
+            end
+            if open then
+                local score = previous and (1 - direction:Dot(previous)) * 8 or 0
+                for j = 1, 6 do
+                    local lead = distance / speed * j / 6
+                    local point = root.Position + direction * speed * lead
+                    score = score + math.max(
+                        dangerAt(point.X, point.Y, point.Z, 0, nil, nil, skip, true),
+                        dangerAt(point.X, point.Y, point.Z, lead + 0.2, nil, nil, skip, true)) * 100
+                end
+                local impact, exit = context.projectileImpact(root.Position, direction, speed, distance / speed)
+                if impact < math.huge then score = score + 10000 / (impact + 0.05) + math.min(exit, 10) * 100 end
+                if target then
+                    score = score + Vector3.new(target.X - endpoint.X, 0, target.Z - endpoint.Z).Magnitude
+                end
+                if not bestScore or score < bestScore then best, bestScore = direction, score end
+            end
+        end
+        return best
+    end
     context.archRefugeCircle = function(humanoid, root, spot, field, now)
         local rt = capturedContext[2]
         local orbit = rt.archRefugeOrbit
@@ -94924,6 +94966,13 @@ components.movementCombat = function(context)
         end
         local underfootFallback = not best and fallback ~= nil
         if underfootFallback then best, bestSign, bestPoint = fallback, fallbackSign, fallbackPoint end
+        if not best then
+            best = context.archMovingFallback(humanoid, root, orbit.direction, nil, spot, field)
+            if best then
+                bestPoint = root.Position + best * math.max(2.2, speed * 0.12)
+                bestSign, underfootFallback, retained = orbit.sign, true, false
+            end
+        end
         orbit.geometryAt, orbit.checkedAt, orbit.checkedPos = geometryAt, now, root.Position
         orbit.checkedDirection = best
         movement.cmdDir = best
@@ -95036,6 +95085,9 @@ components.movementCombat = function(context)
             for i = 0, 15 do
                 local angle = i * math.pi / 8
                 consider(Vector3.new(math.cos(angle), 0, math.sin(angle)))
+            end
+            if not best then
+                best = context.archMovingFallback(humanoid, root, entry.direction, target, nil, field)
             end
             entry.direction = best or entry.direction
             movement.cmdDir, movement.cmdAt, movement.driving = best, rt.brainNow or now, best ~= nil
@@ -166807,7 +166859,7 @@ do
             if bestScore == math.huge then
                 -- Waiting is valid only if the whole stationary interval
                 -- remains clear of both attacks and approaching enemies.
-                local canWait = not orbTooClose and not enemyTooClose
+                local canWait = not archpriestActive and not orbTooClose and not enemyTooClose
                     and enemyDistance(root.Position) >= 38
                 for index = 0, math.ceil((1.25 + pingLead) / 0.05) do
                     if not canWait then break end
@@ -166880,6 +166932,11 @@ do
                 if not failedHeading(retreat, now) and laneOpen(retreat, true)
                     and projectileImpact(retreat) == math.huge then dir = retreat end
             end
+        end
+        if not dir and archpriestActive and context.archMovingFallback then
+            dir = context.archMovingFallback(humanoid, root, lastCommandDir, goal)
+            shortWallStep = dir ~= nil
+            activeFloorTrapped = false
         end
         if not dir then
             committedDir, commitUntil, routeDir = nil, 0, nil
