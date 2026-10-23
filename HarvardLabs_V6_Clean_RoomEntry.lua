@@ -94752,7 +94752,7 @@ components.movementCombat = function(context)
         local earliest, earliestExit, actualEntry = math.huge, math.huge, math.huge
         local body = (context.DG and context.DG.reach or 2) + 1.5
         for _, box in ipairs(context.DG and context.DG.boxes or {}) do
-            if box.moving and not box.far and type(box.speed) == "number"
+            if box.moving and box.weight ~= 0 and not box.far and type(box.speed) == "number"
                 and type(box.dx) == "number" and type(box.dz) == "number"
                 and type(box.ox) == "number" and type(box.oz) == "number"
                 and now <= (box.untilAt or now)
@@ -94761,6 +94761,9 @@ components.movementCombat = function(context)
                 local launch = math.max(box.pathStart or now, now)
                 local wait = launch - now
                 local offset = (box.offset or 0) + box.speed * math.max(now - (box.pathStart or now), 0)
+                -- endAlong terminates this trajectory (for example at a
+                -- bounce). Its rebound is a separate box, not a parked orb.
+                local consumed = box.endAlong and offset >= box.endAlong
                 local pathSpeed = box.speed
                 local stopIn = math.huge
                 if box.endAlong then
@@ -94785,7 +94788,7 @@ components.movementCombat = function(context)
                 end
                 local width = (box.r or box.halfW or 1) + body
                 local length = (box.r or box.halfL or 1) + body
-                if leave >= 0 and slab(along, va, length) and slab(across, vc, width)
+                if not consumed and leave >= 0 and slab(along, va, length) and slab(across, vc, width)
                     and leave >= 0 and enter <= leave then
                     local impact = math.max(0, wait + enter - lead)
                     if impact <= horizon and (impact < earliest
@@ -166690,7 +166693,8 @@ do
                     and forwardClearance >= math.min(38, currentClearance) - 0.5)
             if currentSafe and forwardSafe and enemyLaneSafe and not orbTooClose
                 and not stalled and not wasWaiting and not failedHeading(heading, now)
-                and laneOpen(heading, true) and projectileImpact(heading) == math.huge then
+                and laneOpen(heading, true, math.max(6, humanoid.WalkSpeed * 0.3))
+                and projectileImpact(heading, 0.3) == math.huge then
                 -- Once danger has cleared, approaching the next target is
                 -- legitimate progress, even when it reverses the old dodge.
                 committedDir, commitUntil, routeDir = nil, 0, nil
@@ -167028,12 +167032,11 @@ do
                 context.V6RoomEntry.waiting = true
                 lastCommandDir = nil
                 applyCommand(Vector3.zero, "wait: active floor blocks all exits")
-            elseif projectileImpact(humanoid.MoveDirection, 1.25) < math.huge then
-                -- No checked dodge survived. Do not leave the rejected
-                -- native command running through the projectile lane.
+            elseif humanoid.MoveDirection.Magnitude > 0.01
+                and projectileImpact(humanoid.MoveDirection, 0.3) < math.huge then
                 context.V6RoomEntry.waiting = true
                 lastCommandDir = nil
-                applyCommand(Vector3.zero, "wait: projectile blocks unchecked native route")
+                applyCommand(Vector3.zero, "wait: imminent projectile blocks native step")
             end
             return -- recheck waiting each frame; physical wall recovery otherwise stays native
         end
