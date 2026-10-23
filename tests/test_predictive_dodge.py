@@ -94,6 +94,22 @@ end
  p.route={id=1,points={{x=4,z=0}},previous={x=3.24,z=0}}
  e.x=4.86;e.now=.2
  local c=p:step(e);assert(c.kind=='yield','overshot waypoint caused reverse')''')
+    def test_unsafe_stationary_position_uses_checked_escape_prefix(self):
+        self.run_lua('''local p=Planner.new();local e=scene('entry');e.goal={x=20,z=0}
+ e.risk=function()return 1 end
+ local c=p:step(e);assert(c.kind=='move' and p.route.prefix,'unsafe hold instead of checked prefix')
+ assert(c.target.x^2+c.target.z^2<=3.24^2+.01)
+ local id=c.route;e.now=.01;assert(p:step(e).route==id,'prefix lost commitment due to dwell check')''')
+    def test_prefix_cannot_enter_worse_attack(self):
+        self.run_lua('''local p=Planner.new();local e=scene('entry');e.goal={x=20,z=0}
+ e.risk=function(x) return x>.1 and 2 or 1 end
+ local c=p:step(e);assert(c.kind=='move' and c.target.x<=.1)''')
+    def test_prefix_keeps_projectile_exclusion(self):
+        self.run_lua('''local p=Planner.new();local e=scene('entry');e.risk=function()return 1 end
+ e.projectile=function()return .05 end;assert(p:step(e).kind=='hold')''')
+    def test_safe_standing_does_not_force_risky_prefix(self):
+        self.run_lua('''local p=Planner.new();local e=scene('rows')
+ assert(p:escapePrefix(e)==nil);assert(p:step(e).reason=='aligned in checked row opening')''')
     def test_adapter_compiles(self):
         adapter=(ROOT/'dodge/RobloxAdapter.lua').read_text()
         self.lua.execute('local install=(function()\n'+adapter+'\nend)(); assert(type(install)=="function")')
