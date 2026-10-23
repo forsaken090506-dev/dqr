@@ -131,6 +131,32 @@ end
     def test_proactive_motion_does_not_suspend_all_attacks(self):
         self.run_lua('''local p=Planner.new();local e=scene();e.combat=true;e.native={x=0,z=0}
  local c=p:step(e);assert(c.kind=='move' and not c.holdAttack)''')
+    def test_red_circle_warning_exits_before_short_dwell_would_notice(self):
+        self.run_lua('''local p=Planner.new();local e=scene('circles');e.circleDanger=true;e.native={x=0,z=0}
+ e.circles={{x=0,z=0,r=14,expires=2}}
+ e.risk=function(x,z,t)return t>1.1 and x*x+z*z<14^2 and 1 or 0 end
+ local c=p:step(e);assert(c.kind=='move' and c.target.x^2+c.target.z^2>=14^2,'chose point still inside warning')''')
+    def test_overlapping_circle_exit_clears_both(self):
+        self.run_lua('''local p=Planner.new();local e=scene('circles');e.native={x=0,z=0}
+ e.circles={{x=-4,z=0,r=11,expires=2},{x=4,z=0,r=11,expires=2}}
+ local c=p:step(e);assert(c.kind=='move')
+ for _,circle in ipairs(e.circles) do assert((c.target.x-circle.x)^2+(c.target.z-circle.z)^2>=circle.r^2) end''')
+    def test_circle_exit_rejects_wall_side(self):
+        self.run_lua('''local p=Planner.new();local e=scene('circles');e.native={x=0,z=0}
+ e.circles={{x=0,z=0,r=14,expires=2}}
+ e.wall=function(ax,az,bx,bz)return bx>0 end
+ local c=p:step(e);assert(c.kind=='move' and c.target.x<=0 and c.target.x^2+c.target.z^2>=14^2)''')
+    def test_new_circle_retargets_previously_safe_destination(self):
+        self.run_lua('''local p=Planner.new();local e=scene('circles');p.modeKey='circles';p.serial=1
+ p.route={id=1,points={{x=4,z=0}}};e.circles={{x=4,z=0,r=8,expires=2}}
+ local c=p:step(e);assert(c.kind=='move' and c.route~=1)
+ assert((c.target.x-4)^2+c.target.z^2>=64,'retained a destination covered by new circle')
+ assert(p.events[1].reason=='cancel: new circle covers destination')''')
+    def test_circle_exit_cannot_ignore_activation_deadline(self):
+        self.run_lua('''local p=Planner.new();local e=scene('circles');e.native={x=0,z=0}
+ e.circles={{x=0,z=0,r=14,expires=2}}
+ e.risk=function(x,z,t)return t>.4 and x*x+z*z<14^2 and 1 or 0 end
+ local c=p:step(e);assert(c.kind~='move' or p.route.prefix,'certified an impossible full escape')''')
     def test_adapter_compiles(self):
         adapter=(ROOT/'dodge/RobloxAdapter.lua').read_text()
         self.lua.execute('local install=(function()\n'+adapter+'\nend)(); assert(type(install)=="function")')
