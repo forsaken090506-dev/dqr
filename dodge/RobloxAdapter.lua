@@ -2,7 +2,7 @@
 return function(context, Planner)
     local rt, world, player = context.RT, context.Workspace, context.LocalPlayer
     local planner=Planner.new()
-    local report={build='V7-predictive-waypoints-2-visible-refuge',frames=0,errors=0,decisions={},healthEvents={}}
+    local report={build='V7-predictive-waypoints-3-full-time-window',frames=0,errors=0,decisions={},healthEvents={}}
     local character, rays, lastNative, wasOwned, lastCall=nil,nil,nil,false,-math.huge
     local lastHealth, lastMode, lastSpot=nil,nil,nil
     local lastRowsAt, nativeIdleAt=-math.huge,os.clock()
@@ -240,8 +240,15 @@ return function(context, Planner)
             samples=samples+1
             -- A bounded search must never label unchecked samples safe.
             if samples>3500 then return math.huge end
-            local v=math.max(context.dangerAt(x,pos.Y,z,math.max(0,t-margin),nil,nil,skip,true),
-                context.dangerAt(x,pos.Y,z,t+margin,nil,nil,skip,true))
+            -- Testing only the two ends of this interval can miss an
+            -- attack that begins and ends between them. Include arrival
+            -- itself and sample the whole latency window at <=0.04 seconds.
+            local first,last=math.max(0,t-margin),t+margin
+            local steps=math.max(1,math.ceil((last-first)/0.04))
+            local v=context.dangerAt(x,pos.Y,z,t,nil,nil,skip,true)
+            for i=0,steps do
+                v=math.max(v,context.dangerAt(x,pos.Y,z,first+(last-first)*i/steps,nil,nil,skip,true))
+            end
             riskCache[key]=v
             return v
         end
