@@ -180,6 +180,32 @@ function Planner:choose(e)
     self.lastRejects=reject
     return selected,score
 end
+-- If no complete route can be proved, take only a checked short prefix.
+-- This cannot enter a new hazard from clear ground or cross a projectile;
+-- it can continue leaving the hazard already under the character.
+function Planner:escapePrefix(e)
+    if self:evaluate(e,{},0.25) then return nil end
+    local best,bestScore
+    for _,radius in ipairs({3.24,1.62}) do
+        for i=0,31 do
+            local angle=i*math.pi/16
+            local point={x=e.x+math.cos(angle)*radius,z=e.z+math.sin(angle)*radius}
+            local result=self:evaluate(e,{point},0)
+            if result then
+                local score=result.lastRisk*300+result.exposure*100
+                if e.goal then score=score+dist(point,e.goal)*2 end
+                if self.lastMove then
+                    local dx,dz=unit(e,point)
+                    score=score+(1-dx*self.lastMove.x-dz*self.lastMove.z)*8
+                end
+                if e.room then score=score+math.max(0,6-e.room(point.x,point.z))^2 end
+                if not bestScore or score<bestScore then best,bestScore=point,score end
+            end
+        end
+        if best then break end
+    end
+    return best
+end
 function Planner:step(e)
     if e.modeKey~=self.modeKey then
         if self.route then self:cancel(e,'mechanic changed') end
@@ -199,7 +225,7 @@ function Planner:step(e)
             if advanced>=1.2 then self.progress={x=e.x,z=e.z,at=e.now}
             elseif e.now-self.progress.at>=0.45 then self:cancel(e,'no physical progress') end
             if self.route then
-                local result,why,when=self:evaluate(e,self.route.points,0.1)
+                local result,why,when=self:evaluate(e,self.route.points,self.route.prefix and 0 or 0.1)
                 if result then
                     self.invalidSince=nil
                     return command
@@ -239,8 +265,8 @@ function Planner:step(e)
         end
         return {kind='yield',reason='checked native navigation'}
     end
-    if e.now<self.nextPlan then
-        return {kind='hold',reason='no checked route; retry pending',holdAttack=false}
+    if e.now<self.nextPlan and self:evaluate(e,{},self.nextPlan-e.now) then
+        return {kind='hold',reason='checked wait; retry pending',holdAttack=false}
     end
     self.nextPlan=e.now+0.05
     local points,cost=self:choose(e)
@@ -250,6 +276,14 @@ function Planner:step(e)
         self.progress={x=e.x,z=e.z,at=e.now}
         self:log(e,'commit', {cost=cost,targetX=points[#points].x,targetZ=points[#points].z,waypoints=#points})
         return self:command(e,'new predicted path')
+    end
+    local prefix=self:escapePrefix(e)
+    if prefix then
+        self.serial=self.serial+1
+        self.route={id=self.serial,points={prefix},created=e.now,prefix=true}
+        self.progress={x=e.x,z=e.z,at=e.now}
+        self:log(e,'commit checked escape prefix',{targetX=prefix.x,targetZ=prefix.z})
+        return self:command(e,'short checked escape; full route unavailable')
     end
     if e.now-self.lastLog>=0.25 then
         self.lastLog=e.now
