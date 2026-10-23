@@ -57,6 +57,24 @@ clock=10.2;h.WalkSpeed=0;context.v6FinalizeMovement('pre-physics')
 assert(h.WalkSpeed==0,'game hold overridden')
 clock=10.3;h.WalkSpeed=27;context.v6FinalizeMovement('post-main')
 assert(context.V7Dodge.errors==0)
+-- Reproduce visible green precasts while the central reader has zero spots.
+clock=10.35
+local model={Name='thirdBossMassSafeSpotCircles',IsA=function(self,k)return k=='Model'end}
+local part={Name='precast',Parent=model,Transparency=0,Size=Vector3.new(.2,10,10),
+ Position=Vector3.new(10,0,0),Color={R=.1,G=.8,B=.1},IsA=function(self,k)return k=='BasePart'end}
+model.GetDescendants=function()return {part}end
+world.GetDescendants=function()return {model,part}end
+local bossRoot={Position=Vector3.new(80,0,0),AssemblyLinearVelocity=Vector3.zero,Parent=true}
+context.RD.enemies={{root=bossRoot,model={Name='Archpriestess Kiryne',FindFirstChildOfClass=function()return {Health=100}end}}}
+context.RD.safeField=nil;context.RD.safeSpots={}
+context.dangerAt=function(x,y,z,t,a,b,skip)
+ if skip and skip({name='archpriestsafezones'}) then return 0 end
+ return 1
+end
+context.v6FinalizeMovement('post-main')
+assert(context.V7Dodge.errors==0,context.V7Dodge.lastError)
+assert(context.V7Dodge.mode=='entry' and context.V7Dodge.visibleRefuges==1,'visible refuge not recognized')
+assert(context.V7Dodge.refugeSource=='visible boss precasts' and h.MoveDirection.Magnitude>0,'held outside visible refuge')
 clock=10.4;context.RT.farmEnabled=false;context.v6FinalizeMovement('pre-physics')
 assert(h.MoveDirection.Magnitude==0,'farm disable did not release movement')
 local before=h.moves
