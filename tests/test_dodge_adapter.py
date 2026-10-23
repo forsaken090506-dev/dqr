@@ -65,6 +65,19 @@ clock=10.2;h.WalkSpeed=0;context.v6FinalizeMovement('pre-physics')
 assert(h.WalkSpeed==0,'game hold overridden')
 clock=10.3;h.WalkSpeed=27;context.v6FinalizeMovement('post-main')
 assert(context.V7Dodge.errors==0)
+-- Recognize tracked first-boss red circles before the generic short horizon fires.
+clock=10.32
+local circlePart={Parent=true,Size=Vector3.new(.2,20,20),Position=Vector3.zero,
+ IsA=function(self,k)return k=='BasePart'end}
+local trackedBossRoot={Parent=true,Position=Vector3.new(80,0,0),AssemblyLinearVelocity=Vector3.zero}
+context.RD.enemies={{root=trackedBossRoot,model={Name='Archpriestess Kiryne',FindFirstChildOfClass=function()return {Health=100}end}}}
+context.RD.models={[circlePart]={name='gs circle',spawn=clock,untilAt=clock+1.6}}
+context.dangerAt=function()return 0 end
+context.v6FinalizeMovement('post-main')
+assert(context.V7Dodge.errors==0,context.V7Dodge.lastError)
+assert(context.V7Dodge.mode=='circles' and context.V7Dodge.circleWarnings==1,'red-circle warning not recognized')
+assert(h.MoveDirection.Magnitude>0,'did not start early circle exit')
+context.RD.models={}
 -- Reproduce visible green precasts while the central reader has zero spots.
 clock=10.35
 local model={Name='thirdBossMassSafeSpotCircles',IsA=function(self,k)return k=='Model'end}
