@@ -94839,6 +94839,73 @@ components.movementCombat = function(context)
         end
         return best
     end
+    context.archRowGapTick = function(humanoid, root, now)
+        if not context.gsB1Lanes or not context.gsB1Lanes(now) then return false end
+        local speed = context.speedNormal()
+        local rt = capturedContext[2]
+        local rays = RaycastParams.new()
+        rays.FilterType = Enum.RaycastFilterType.Exclude
+        rays.FilterDescendantsInstances = {localPlayer.Character}
+        rays.RespectCanCollide = true
+        local ping = math.clamp(tonumber(rt.pingS or rt.dataPingS) or 0, 0, 0.6)
+        local best, bestScore
+        local function clear(point, lead)
+            return dangerAt(point.X, point.Y, point.Z, lead, nil, nil, nil, true) < 0.12
+        end
+        local function consider(point, preference)
+            local delta = Vector3.new(point.X - root.Position.X, 0, point.Z - root.Position.Z)
+            local distance = delta.Magnitude
+            local arrival = distance / speed
+            -- A gap must survive arrival and the next wave, not just be
+            -- visually empty in the current snapshot.
+            for i = 0, 12 do
+                if not clear(point, arrival + i * 0.05)
+                    or not clear(point, arrival + ping + i * 0.05) then return end
+            end
+            if distance > 0.1 then
+                local direction = delta.Unit
+                if context.projectileImpact(root.Position, direction, speed, arrival) < math.huge then return end
+                local side = Vector3.new(-direction.Z, 0, direction.X)
+                for _, offset in ipairs({0, -1.5, 1.5}) do
+                    if workspaceService:Raycast(root.Position + Vector3.new(0, 1.5, 0) + side * offset,
+                        delta, rays) then return end
+                end
+                local startClear = clear(root.Position, 0)
+                local steps = math.max(1, math.ceil(distance / 1.0))
+                for i = 1, steps do
+                    local lead = arrival * i / steps
+                    local probe = root.Position + delta * (i / steps)
+                    local active = clear(probe, 0)
+                    if active then startClear = true elseif startClear then return end
+                    if not clear(probe, lead) or not clear(probe, lead + ping) then return end
+                end
+            elseif context.projectileImpact(root.Position, Vector3.zero, speed, 0.6 + ping) < math.huge then
+                return
+            end
+            local score = distance + preference
+            if not bestScore or score < bestScore then best, bestScore = point, score end
+        end
+        if rt.archRowGap then consider(rt.archRowGap, -3) end
+        consider(root.Position, 0)
+        if not best then
+        for _, radius in ipairs({3, 6, 9, 12, 18, 24}) do
+            for i = 0, 31 do
+                local angle = i * math.pi / 16
+                consider(root.Position + Vector3.new(math.cos(angle), 0, math.sin(angle)) * radius, 0)
+            end
+        end
+        end
+        if not best then rt.archRowGap = nil return false end
+        rt.archRowGap = best
+        local delta = Vector3.new(best.X - root.Position.X, 0, best.Z - root.Position.Z)
+        local direction = delta.Magnitude > 0.65 and delta.Unit or nil
+        movement.cmdDir, movement.cmdAt, movement.driving = direction, rt.brainNow or now, direction ~= nil
+        movementBoost.steer(direction)
+        humanoid:Move(direction or Vector3.zero, false)
+        setState(direction and "FIRST BOSS: moving into checked row opening"
+            or "FIRST BOSS: aligned in row opening; watching next wave")
+        return true
+    end
     context.archRefugeCircle = function(humanoid, root, spot, field, now)
         local rt = capturedContext[2]
         local orbit = rt.archRefugeOrbit
@@ -166406,6 +166473,16 @@ do
             idleAt = now
             return
         end
+        local rowPattern = archpriestActive and context.gsB1Lanes and context.gsB1Lanes(now)
+        if rowPattern and context.archRowGapTick then
+            local ok, handled = pcall(context.archRowGapTick, humanoid, root, now)
+            if ok and handled then
+                committedDir, commitUntil, routeDir, lastCommandDir = nil, 0, nil, nil
+                progressPos, progressAt = root.Position, now
+                report.lastDecision = "first boss: row opening owns movement"
+                return
+            elseif not ok then report.lastError = tostring(handled) end
+        end
         -- The dungeon controller has detailed geometry for named attacks.
         -- Keep its route unless a live enemy has already breached the inner
         -- envelope. The 17:47 recording showed the named escape arriving while
@@ -166859,7 +166936,7 @@ do
             if bestScore == math.huge then
                 -- Waiting is valid only if the whole stationary interval
                 -- remains clear of both attacks and approaching enemies.
-                local canWait = not archpriestActive and not orbTooClose and not enemyTooClose
+                local canWait = (not archpriestActive or rowPattern) and not orbTooClose and not enemyTooClose
                     and enemyDistance(root.Position) >= 38
                 for index = 0, math.ceil((1.25 + pingLead) / 0.05) do
                     if not canWait then break end
@@ -166933,7 +167010,7 @@ do
                     and projectileImpact(retreat) == math.huge then dir = retreat end
             end
         end
-        if not dir and archpriestActive and context.archMovingFallback then
+        if not dir and archpriestActive and not rowPattern and context.archMovingFallback then
             dir = context.archMovingFallback(humanoid, root, lastCommandDir, goal)
             shortWallStep = dir ~= nil
             activeFloorTrapped = false
