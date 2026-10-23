@@ -80,7 +80,7 @@ components.coreSettings = function(context)
     _G.DungeonAutofarmVersion = "v3.0 c84b"
     local burstMin, burstMaxSpeed = 18, 28
     local config = {
-        tweenWalk = 16,
+        tweenWalk = 27,
         tweenEscape = 26,
         burstMin = burstMin,
         burstMax = burstMaxSpeed,
@@ -1316,7 +1316,7 @@ components.coreSettings = function(context)
     config.upgradeCountAbbrev = true
     config.itemGodpot = true
     config.birdsEyeCam = false
-    config.speedCustom = false
+    config.speedCustom = true
     config.speedNormal = 27
     config.speedBurst = 27
 
@@ -2474,7 +2474,7 @@ components.coreSettings = function(context)
                 streamerOthers = true,
                 streamerWealth = true,
                 targetPriority = "group",
-                tweenWalk = 16,
+                tweenWalk = 27,
                 wallClearView = true,
                 wallTransparency = 0,
                 wallsOn = true,
@@ -2619,7 +2619,7 @@ components.coreSettings = function(context)
                 streamerOthers = true,
                 streamerWealth = true,
                 targetPriority = "group",
-                tweenWalk = 16,
+                tweenWalk = 27,
                 wallClearView = true,
                 wallsOn = true,
                 wallsV2 = true,
@@ -52015,6 +52015,11 @@ components.movementCombat = function(context)
         return 27
     end
     context.speedApply = function()
+        -- Keep loaded settings and normal movement controllers at the fixed speed.
+        capturedContext[1].speedCustom = true
+        capturedContext[1].speedNormal = 27
+        capturedContext[1].speedBurst = 27
+        capturedContext[1].tweenWalk = 27
         local value = {}
         local speedSnap, value2 = capturedContext[2].speedSnap, context.LC and context.LC.CONFIG
         if context.speedCustomOn() then
