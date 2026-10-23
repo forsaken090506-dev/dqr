@@ -114,13 +114,29 @@ function Planner:cancel(e,reason)
     self.route,self.progress,self.invalidSince=nil,nil,nil
     self.nextPlan=0
 end
+function Planner:destinationClear(e,points,travel)
+    local target=points[#points]
+    if not target then return true end
+    for _,circle in ipairs(e.circles or {}) do
+        if (circle.expires or huge)>travel and dist(target,circle)<circle.r-0.01 then return false end
+    end
+    return true
+end
 function Planner:choose(e)
     local selected,score
     local reject={}
     local function consider(points)
+        local target=points[#points]
+        -- A short dwell can finish before a warned circle fires. Do not
+        -- mistake a point still inside that warning for an escape destination.
+        local travel,origin=0,{x=e.x,z=e.z}
+        for _,point in ipairs(points) do travel=travel+dist(origin,point)/e.speed origin=point end
+        if not self:destinationClear(e,points,travel) then
+            reject['inside circle warning']=(reject['inside circle warning'] or 0)+1
+            return
+        end
         local result,why=self:evaluate(e,points,0.3)
         if not result then reject[why]=(reject[why] or 0)+1 return end
-        local target=points[#points]
         for _,bad in ipairs(self.blocked) do
             if e.now<bad.untilAt and dist(target,bad)<2 then return end
         end
@@ -139,6 +155,33 @@ function Planner:choose(e)
             cost=cost+math.abs(dist(target,e.circle)-e.circle.r*0.72)
         end
         if not score or cost<score then selected,score=points,cost end
+    end
+    -- Geometry-driven exits cover circles wider than the generic search
+    -- radii and narrow openings between overlapping circles.
+    local circles=e.circles or {}
+    for _,circle in ipairs(circles) do
+        local angle=math.atan2 and math.atan2(e.z-circle.z,e.x-circle.x)
+            or math.atan(e.z-circle.z,e.x-circle.x)
+        consider({{x=circle.x+math.cos(angle)*(circle.r+0.4),z=circle.z+math.sin(angle)*(circle.r+0.4)}})
+        for i=0,23 do
+            local a=i*math.pi/12
+            consider({{x=circle.x+math.cos(a)*(circle.r+0.4),z=circle.z+math.sin(a)*(circle.r+0.4)}})
+        end
+    end
+    for i=1,#circles do
+        for j=i+1,#circles do
+            local a,b=circles[i],circles[j]
+            local d=dist(a,b)
+            local ra,rb=a.r+0.4,b.r+0.4
+            if d>0.001 and d<ra+rb and d>math.abs(ra-rb) then
+                local along=(ra*ra-rb*rb+d*d)/(2*d)
+                local height=sqrt(math.max(0,ra*ra-along*along))
+                local ux,uz=(b.x-a.x)/d,(b.z-a.z)/d
+                local x,z=a.x+ux*along,a.z+uz*along
+                consider({{x=x-uz*height,z=z+ux*height}})
+                consider({{x=x+uz*height,z=z-ux*height}})
+            end
+        end
     end
     if e.mode=='refuge' and e.circle then
         local angle=math.atan2 and math.atan2(e.z-e.circle.z,e.x-e.circle.x)
@@ -242,6 +285,9 @@ function Planner:step(e)
             elseif e.now-self.progress.at>=0.45 then self:cancel(e,'no physical progress') end
             if self.route then
                 local result,why,when=self:evaluate(e,self.route.points,self.route.prefix and 0 or 0.1)
+                if result and not self.route.prefix and not self:destinationClear(e,self.route.points,result.time) then
+                    result,why,when=nil,'new circle covers destination',0
+                end
                 if result then
                     self.invalidSince=nil
                     return command
@@ -270,10 +316,10 @@ function Planner:step(e)
     if e.mode=='rows' and self:evaluate(e,{},0.6) and enemy>=9 then
         return {kind='hold',reason='aligned in checked row opening',holdAttack=false}
     end
-    local specialized=e.mode=='entry' or e.mode=='refuge' or e.mode=='rows'
-    local preferMotion=e.mode=='entry' or e.mode=='refuge'
+    local specialized=e.mode=='entry' or e.mode=='refuge' or e.mode=='rows' or e.mode=='circles'
+    local preferMotion=e.mode=='entry' or e.mode=='refuge' or e.mode=='circles'
         or (e.mode~='rows' and (e.combat or enemy<28))
-    self.defensive=not safeNative or enemy<20 or e.mode=='entry' or e.mode=='rows'
+    self.defensive=not safeNative or enemy<20 or e.mode=='entry' or e.mode=='rows' or e.circleDanger
 
     -- Do not turn clean dungeon travel into constant evasion. Native room
     -- navigation remains responsible for long paths and doorway traversal.
