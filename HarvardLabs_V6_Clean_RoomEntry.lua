@@ -94916,10 +94916,16 @@ components.movementCombat = function(context)
     context.archRefugeCircle = function(humanoid, root, spot, field, now)
         local rt = capturedContext[2]
         local orbit = rt.archRefugeOrbit
-        if not orbit or orbit.field ~= field or orbit.spot ~= spot then
-            orbit = {field = field, spot = spot, sign = 1}
+        local sameCircle = orbit and orbit.cx and now - (orbit.seenAt or 0) < 0.5
+            and (orbit.cx - spot.x) ^ 2 + (orbit.cz - spot.z) ^ 2 < 1
+            and math.abs((orbit.radius or 0) - (spot.r or 0)) < 1
+        if not sameCircle then
+            orbit = {sign = 1}
             rt.archRefugeOrbit = orbit
         end
+        -- Reader refreshes may replace the tables without changing the zone.
+        orbit.field, orbit.spot = field, spot
+        orbit.cx, orbit.cz, orbit.radius, orbit.seenAt = spot.x, spot.z, spot.r, now
         -- Main-loop and pre-physics passes can see the exact same reader
         -- snapshot. Reapply its checked command without rescoring it twice.
         local geometryAt = context.DG and context.DG.now
@@ -166270,10 +166276,29 @@ do
     local sensedRoots, sensorAt = {}, -math.huge
     local forcedLook = false
     local savedAutoRotate = true
-    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-23-net-progress-short-recovery" }
+    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-23-stable-dodge-ownership" }
     -- Run after render/player input and immediately before physical movement.
     local motionSignal = runService.PreSimulation or runService.RenderStepped or runService.Heartbeat
     _G.HL_V6_CONTROLLER_REPORT = context.V6RoomEntry
+    local function retainDodgeStep(span, openLane, hitAt, riskAtTime, clearanceAtTime, limit)
+        if not openLane or hitAt < math.huge then return false end
+        local startRisk = riskAtTime(0)
+        if type(startRisk) ~= "number" or startRisk ~= startRisk or startRisk == math.huge then return false end
+        local cleared = startRisk < limit
+        local startClearance = clearanceAtTime(0)
+        for index = 1, 6 do
+            local t = span * index / 6
+            local risk = riskAtTime(t)
+            if type(risk) ~= "number" or risk ~= risk or risk == math.huge then return false end
+            if risk < limit then
+                cleared = true
+            elseif cleared or risk > startRisk + 0.01 then
+                return false
+            end
+            if clearanceAtTime(t) < math.min(12, startClearance) - 0.5 then return false end
+        end
+        return true
+    end
     local function controllerTick(phase)
         context.V6RoomEntry.frames = (context.V6RoomEntry.frames or 0) + 1
         if context.RT.destroyed or not context.RT.farmEnabled then return end
@@ -166662,6 +166687,30 @@ do
         -- Do not compete with the game's normal movement controller while it
         -- is already carrying us through a safe lane. The watchdog only takes
         -- ownership when the next short step is genuinely dangerous.
+        -- A validated dodge owns this brief interval before native movement
+        -- can take over. Validate the step we will execute, rather than
+        -- discarding it because of a hazard 30 studs down an unexecuted ray.
+        if committedDir and now < commitUntil and not stalled and context.dangerAt then
+            local span = math.min(0.24, math.max(0.08, commitUntil - now))
+            local speed = math.max(humanoid.WalkSpeed, 12)
+            local open = laneOpen(committedDir, false, math.max(2.2, speed * span))
+                and not failedHeading(committedDir, now)
+            local function stepRisk(t)
+                local point = root.Position + committedDir * speed * t
+                return routeDanger(point.X, point.Y, point.Z, t)
+            end
+            local function stepClearance(t)
+                return enemyDistance(root.Position + committedDir * speed * t, t + pingLead)
+            end
+            if retainDodgeStep(span, open, projectileImpact(committedDir, span),
+                stepRisk, stepClearance, riskLimit) then
+                routeDir, lastCommandDir = committedDir, committedDir
+                applyCommand(routeDir, "move: retained checked dodge step")
+                return
+            end
+            committedDir, commitUntil, routeDir = nil, 0, nil
+            lastScanAt = -math.huge
+        end
         if moving and context.dangerAt then
             local heading = humanoid.MoveDirection.Unit
             local travelLead = 0.12
@@ -166702,55 +166751,6 @@ do
                 report.lastDecision = "yield: safe native route; retreat complete"
                 return
             end
-        end
-        -- Keep ownership of an established escape lane long enough to clear
-        -- the whole telegraph. This prevents the combat controller from
-        -- steering back toward the enemies halfway through the dodge.
-        if committedDir and now < commitUntil and context.dangerAt then
-            local hitAt, exitAt, actualEntry = projectileImpact(committedDir)
-            local laneSafe = laneOpen(committedDir, false)
-                and hitAt == math.huge
-            local initialEnemyDistance = enemyDistance(root.Position)
-            local startOk, startRisk = pcall(routeDanger,
-                root.Position.X, root.Position.Y, root.Position.Z, 0)
-            local exiting = startOk and type(startRisk) == "number" and startRisk >= riskLimit
-            local cleared = not exiting
-            for _, travelLead in ipairs(routeSamples) do
-                local hazardLead = travelLead + pingLead
-                local probe = root.Position
-                    + committedDir * math.max(humanoid.WalkSpeed, 12) * travelLead
-                local commitOk, commitRisk = pcall(
-                    routeDanger,
-                    probe.X,
-                    probe.Y,
-                    probe.Z,
-                    travelLead
-                )
-                -- An escape may have an unavoidable unsafe prefix. Keep it
-                -- only if risk does not increase, it reaches clear space,
-                -- and never enters another attack after clearing the first.
-                local hazardSafe = commitOk and type(commitRisk) == "number"
-                if hazardSafe then
-                    if commitRisk < riskLimit then
-                        cleared = true
-                    elseif cleared or not exiting or commitRisk > startRisk + 0.01 then
-                        hazardSafe = false
-                    end
-                end
-                if not hazardSafe
-                    or enemyDistance(probe, hazardLead) < math.min(38, initialEnemyDistance) - 1 then
-                    laneSafe = false
-                    break
-                end
-            end
-            if laneSafe and cleared then
-                routeDir = committedDir
-                lastCommandDir = routeDir
-                applyCommand(routeDir, "move: final escape")
-                return
-            end
-            committedDir, commitUntil, routeDir = nil, 0, nil
-            lastScanAt = -math.huge
         end
         if specializedEscape and not enemyEmergency and not stalled and not wasWaiting
             and moving and not failedHeading(humanoid.MoveDirection, now)
@@ -167043,14 +167043,10 @@ do
         if dir.Magnitude > 0.01 then
             context.V6RoomEntry.waiting = false
             routeDir = dir.Unit
+            committedDir = routeDir
+            commitUntil = now + (shortWallStep and 0.12 or 0.24)
             if shortWallStep then
-                -- This is a local corner step, not a long escape commitment.
-                -- Re-evaluate the geometry on the next frame.
-                committedDir, commitUntil, lastScanAt = nil, 0, -math.huge
                 report.wallSteps = (report.wallSteps or 0) + 1
-            elseif moving then
-                committedDir = routeDir
-                commitUntil = now + (enemyEmergency and 0.70 or 1.25)
             end
             lastCommandDir = routeDir
             context.V6RoomEntry.lastDecision = "move: selected escape heading"
