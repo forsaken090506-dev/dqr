@@ -44,6 +44,14 @@ context={RT={farmEnabled=true},Workspace=world,LocalPlayer={Character=ch},CFG={}
         lua.execute('''
 context.v6FinalizeMovement('post-main')
 assert(context.V7Dodge.errors==0 and context.V7Dodge.lastDecision=='checked native navigation')
+-- A brief regular hit sits between the latency-window endpoints.
+clock=10.04;context.dangerAt=function(x,y,z,t)
+ return x>3.8 and x<4.3 and t>.13 and t<.17 and 1 or 0
+end
+context.v6FinalizeMovement('post-main')
+assert(context.V7Dodge.errors==0,context.V7Dodge.lastError)
+assert(context.V7Dodge.lastDecision~='checked native navigation','brief opening attack missed between time samples')
+_G.HL_V7_DODGE.planner:reset();h.MoveDirection=Vector3.new(1,0,0)
 clock=10.1;context.dangerAt=function(x,y,z,t) return x>2 and math.abs(z)<3 and 1 or 0 end
 context.v6FinalizeMovement('post-main')
 assert(context.V7Dodge.errors==0 and context.V7Dodge.route,'adapter failed to select route')
