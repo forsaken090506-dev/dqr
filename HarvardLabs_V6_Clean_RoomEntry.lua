@@ -94984,9 +94984,65 @@ components.movementCombat = function(context)
         if dx * dx + dz * dz <= inset * inset then
             context.archRefugeCircle(humanoid, root, spot, field, now)
         else
-            helper2(humanoid, root, via or Vector3.new(spot.x, root.Position.Y, spot.z),
-                context.speedNormal(), 0.5)
-            setState("SAFE SPOT: entering first-boss refuge")
+            local rt = capturedContext[2]
+            local entry = rt.archRefugeEntry
+            if not entry or entry.field ~= field then
+                entry = {field = field}
+                rt.archRefugeEntry = entry
+            end
+            local target = via or Vector3.new(spot.x, root.Position.Y, spot.z)
+            local delta = Vector3.new(target.X - root.Position.X, 0, target.Z - root.Position.Z)
+            local speed = context.speedNormal()
+            local horizon = math.min(0.3, math.max(delta.Magnitude / speed, 0.08))
+            local distance = speed * horizon
+            local ping = math.clamp(tonumber(rt.pingS or rt.dataPingS) or 0, 0, 0.6)
+            local rays = RaycastParams.new()
+            rays.FilterType = Enum.RaycastFilterType.Exclude
+            rays.FilterDescendantsInstances = {localPlayer.Character}
+            rays.RespectCanCollide = true
+            local function skipField(box) return tostring(box.name or "") == tostring(field.name) end
+            local function risk(point, lead)
+                return dangerAt(point.X, point.Y, point.Z, lead, nil, nil, skipField, true)
+            end
+            local startRisk = risk(root.Position, 0)
+            local best, bestScore
+            local function consider(direction)
+                local impact, exit, actualEntry = context.projectileImpact(root.Position, direction, speed, horizon)
+                if impact < math.huge and (actualEntry > 0 or exit > horizon) then return end
+                local side = Vector3.new(-direction.Z, 0, direction.X)
+                for _, offset in ipairs({0, -1.5, 1.5}) do
+                    if workspaceService:Raycast(root.Position + Vector3.new(0, 1.5, 0) + side * offset,
+                        direction * distance, rays) then return end
+                end
+                local exposure, cleared = 0, startRisk < 0.12
+                for i = 1, 6 do
+                    local lead = horizon * i / 6
+                    local point = root.Position + direction * speed * lead
+                    local active = risk(point, 0)
+                    if active < 0.12 then cleared = true
+                    elseif cleared then return end
+                    exposure = exposure + math.max(active, risk(point, lead), risk(point, lead + ping + 0.1))
+                end
+                local endpoint = root.Position + direction * distance
+                local remaining = Vector3.new(target.X - endpoint.X, 0, target.Z - endpoint.Z).Magnitude
+                local score = exposure / 6 * 100 + remaining
+                if entry.direction then
+                    score = score + (1 - direction:Dot(entry.direction)) * 8
+                end
+                if not bestScore or score < bestScore then best, bestScore = direction, score end
+            end
+            if entry.direction then consider(entry.direction) end
+            if delta.Magnitude > 0.1 then consider(delta.Unit) end
+            for i = 0, 15 do
+                local angle = i * math.pi / 8
+                consider(Vector3.new(math.cos(angle), 0, math.sin(angle)))
+            end
+            entry.direction = best or entry.direction
+            movement.cmdDir, movement.cmdAt, movement.driving = best, rt.brainNow or now, best ~= nil
+            movementBoost.steer(best)
+            humanoid:Move(best or Vector3.zero, false)
+            setState(best and "SAFE SPOT: steering into first-boss refuge"
+                or "SAFE SPOT: entry blocked; rechecking escape routes")
         end
         return true
     end
