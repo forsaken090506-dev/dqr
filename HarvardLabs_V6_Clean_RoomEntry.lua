@@ -94961,7 +94961,7 @@ components.movementCombat = function(context)
         end
         local best, bestSign, bestScore, bestPoint = nil, orbit.sign, math.huge, nil
         local fallback, fallbackSign, fallbackScore, fallbackPoint = nil, orbit.sign, math.huge, nil
-        local function consider(point, sign, preference)
+        local function consider(point, sign, preference, retaining)
             local delta = Vector3.new(point.X - root.Position.X, 0, point.Z - root.Position.Z)
             if delta.Magnitude < 0.2 then return end
             local direction = delta.Unit
@@ -94977,19 +94977,27 @@ components.movementCombat = function(context)
                 if workspaceService:Raycast(root.Position + Vector3.new(0, 1.5, 0) + side * offset,
                     direction * distance, orbit.rays) then return end
             end
-            local cleared = startRisk < 0.12
+            local initialRisk = retaining and startActive or startRisk
+            local cleared = initialRisk < 0.12
             local activeCleared = startActive < 0.12
             local exposure = 0
             local forecastBlocked = false
             local steps = math.max(1, math.ceil(distance / 1.25))
             for index = 1, steps do
                 local travel = distance * index / steps
-                local risk, active = riskAt(root.Position + direction * travel, travel / speed)
+                local probe = root.Position + direction * travel
+                local risk, active = riskAt(probe, travel / speed)
+                if retaining then
+                    -- Keep the selected arc when only the extra forecast
+                    -- margin changes; still reject actual arrival collisions.
+                    risk = math.max(active, dangerAt(probe.X, probe.Y, probe.Z,
+                        travel / speed, nil, nil, skipField, true))
+                end
                 if active < 0.12 then activeCleared = true
                 elseif activeCleared then return end
                 if risk < 0.12 then
                     cleared = true
-                elseif cleared or risk > startRisk + 0.01 then
+                elseif cleared or risk > initialRisk + 0.01 then
                     forecastBlocked = true
                 end
                 exposure = exposure + risk
@@ -95018,7 +95026,7 @@ components.movementCombat = function(context)
         -- frame still rechecks hazards, projectile interception and walls.
         if orbit.point and now < (orbit.holdUntil or 0)
             and (orbit.point - root.Position).Magnitude > speed * 0.04 then
-            consider(orbit.point, orbit.sign, 0)
+            consider(orbit.point, orbit.sign, 0, true)
         end
         local retained = best ~= nil
         if not retained then
@@ -95062,7 +95070,7 @@ components.movementCombat = function(context)
         humanoid:Move(best or Vector3.zero, false)
         if best then
             orbit.sign, orbit.direction = bestSign, best
-            if not retained then orbit.point, orbit.holdUntil = bestPoint, now + 0.35 end
+            if not retained then orbit.point, orbit.holdUntil = bestPoint, now + 0.65 end
             if underfootFallback then
                 -- The waypoint is still revalidated each frame; retain its
                 -- heading penalty instead of resetting it after every fallback.
@@ -166281,21 +166289,22 @@ do
     local motionSignal = runService.PreSimulation or runService.RenderStepped or runService.Heartbeat
     _G.HL_V6_CONTROLLER_REPORT = context.V6RoomEntry
     local function retainDodgeStep(span, openLane, hitAt, riskAtTime, clearanceAtTime, limit)
-        if not openLane or hitAt < math.huge then return false end
+        if not openLane then return false, "wall or stalled heading" end
+        if hitAt < math.huge then return false, "projectile collision" end
         local startRisk = riskAtTime(0)
-        if type(startRisk) ~= "number" or startRisk ~= startRisk or startRisk == math.huge then return false end
+        if type(startRisk) ~= "number" or startRisk ~= startRisk or startRisk == math.huge then return false, "invalid risk or enemy clearance" end
         local cleared = startRisk < limit
         local startClearance = clearanceAtTime(0)
         for index = 1, 6 do
             local t = span * index / 6
             local risk = riskAtTime(t)
-            if type(risk) ~= "number" or risk ~= risk or risk == math.huge then return false end
+            if type(risk) ~= "number" or risk ~= risk or risk == math.huge then return false, "invalid risk or enemy clearance" end
             if risk < limit then
                 cleared = true
             elseif cleared or risk > startRisk + 0.01 then
-                return false
+                return false, "attack intersects committed step"
             end
-            if clearanceAtTime(t) < math.min(12, startClearance) - 0.5 then return false end
+            if clearanceAtTime(t) < math.min(12, startClearance) - 0.5 then return false, "invalid risk or enemy clearance" end
         end
         return true
     end
@@ -166691,23 +166700,29 @@ do
         -- can take over. Validate the step we will execute, rather than
         -- discarding it because of a hazard 30 studs down an unexecuted ray.
         if committedDir and now < commitUntil and not stalled and context.dangerAt then
-            local span = math.min(0.24, math.max(0.08, commitUntil - now))
+            local span = math.min(0.18, math.max(0.06, commitUntil - now))
             local speed = math.max(humanoid.WalkSpeed, 12)
             local open = laneOpen(committedDir, false, math.max(2.2, speed * span))
                 and not failedHeading(committedDir, now)
             local function stepRisk(t)
                 local point = root.Position + committedDir * speed * t
-                return routeDanger(point.X, point.Y, point.Z, t)
+                -- The long-range planner already includes ping margin.
+                -- Retention checks collision at this step's arrival time,
+                -- rather than cancelling for a later, unexecuted forecast.
+                return strictDanger(point.X, point.Y, point.Z, t)
             end
             local function stepClearance(t)
                 return enemyDistance(root.Position + committedDir * speed * t, t + pingLead)
             end
-            if retainDodgeStep(span, open, projectileImpact(committedDir, span),
-                stepRisk, stepClearance, riskLimit) then
+            local keep, reason = retainDodgeStep(span, open, projectileImpact(committedDir, span),
+                stepRisk, stepClearance, riskLimit)
+            if keep then
                 routeDir, lastCommandDir = committedDir, committedDir
                 applyCommand(routeDir, "move: retained checked dodge step")
                 return
             end
+            report.commitCancelled = reason
+            report.commitCancels = (report.commitCancels or 0) + 1
             committedDir, commitUntil, routeDir = nil, 0, nil
             lastScanAt = -math.huge
         end
@@ -166777,6 +166792,7 @@ do
         local dir
         local activeFloorTrapped = false
         local shortWallStep = false
+        local selectedExit = 0
         local brain = context.BR
         local goal = brain and (brain.goTo or brain.target and brain.target.root and brain.target.root.Position)
         if goal then
@@ -166985,6 +167001,7 @@ do
                     return -- no cooldown: re-score every frame until a route opens
                 end
                 best = fallback
+                if fallback then selectedExit = fallbackExit end
                 activeFloorTrapped = not fallback and startsClear and activeBlocked > 0
                 context.V6RoomEntry.fallbackExit = fallbackExit
             end
@@ -167044,7 +167061,7 @@ do
             context.V6RoomEntry.waiting = false
             routeDir = dir.Unit
             committedDir = routeDir
-            commitUntil = now + (shortWallStep and 0.12 or 0.24)
+            commitUntil = now + (shortWallStep and 0.12 or math.clamp(selectedExit + 0.15, 0.65, 1.25))
             if shortWallStep then
                 report.wallSteps = (report.wallSteps or 0) + 1
             end
