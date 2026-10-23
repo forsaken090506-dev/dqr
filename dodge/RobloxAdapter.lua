@@ -2,7 +2,7 @@
 return function(context, Planner)
     local rt, world, player = context.RT, context.Workspace, context.LocalPlayer
     local planner=Planner.new()
-    local report={build='V7-predictive-waypoints-3-full-time-window',frames=0,errors=0,decisions={},healthEvents={}}
+    local report={build='V7-predictive-waypoints-4-continuous-handoff',frames=0,errors=0,decisions={},healthEvents={}}
     local character, rays, lastNative, wasOwned, lastCall=nil,nil,nil,false,-math.huge
     local lastHealth, lastMode, lastSpot=nil,nil,nil
     local lastRowsAt, nativeIdleAt=-math.huge,os.clock()
@@ -227,7 +227,7 @@ return function(context, Planner)
         local ping=tonumber(rt.pingS or rt.dataPingS) or 0
         if ping>2 then ping=ping/1000 end
         local margin=math.clamp(ping*0.5+0.04,0.04,0.2)
-        local e={now=now,x=pos.X,z=pos.Z,speed=27,mode=mode,modeKey=modeKey,goal=goal,circle=circle,
+        local e={now=now,x=pos.X,z=pos.Z,speed=27,mode=mode,modeKey=modeKey,goal=goal,circle=circle,combat=bossPresent,
             native=lastNative and now-lastNative.at<0.25 and lastNative or {x=0,z=0}}
         if mode=='normal' and goal and now-nativeIdleAt>0.45 then
             local dx,dz=goal.x-pos.X,goal.z-pos.Z
