@@ -166144,7 +166144,7 @@ do
     local sensedRoots, sensorAt = {}, -math.huge
     local forcedLook = false
     local savedAutoRotate = true
-    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-23-underfoot-refuge-motion" }
+    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-23-net-progress-short-recovery" }
     -- Run after render/player input and immediately before physical movement.
     local motionSignal = runService.PreSimulation or runService.RenderStepped or runService.Heartbeat
     _G.HL_V6_CONTROLLER_REPORT = context.V6RoomEntry
@@ -166203,19 +166203,24 @@ do
         -- A hazard-free direction is still useless when it points into a
         -- wall. Drop a committed lane as soon as it stops producing real
         -- displacement so the next scan can choose an open escape instead.
-        if not progressPos or (root.Position - progressPos).Magnitude >= 0.35 then
+        local progressDelta = progressPos and Vector3.new(root.Position.X - progressPos.X, 0,
+            root.Position.Z - progressPos.Z).Magnitude or math.huge
+        local attempted = lastCommandDir or (moving and humanoid.MoveDirection.Unit)
+        if not progressPos or progressDelta >= 1.5 then
             progressPos, progressAt = root.Position, now
-        elseif lastCommandDir and now - progressAt >= 0.25 then
-            -- Resetting commitment alone selected the same failed lane again.
-            -- Briefly penalize the failed heading, while retaining it as a
-            -- fallback if every alternative becomes unsafe or blocked.
+        elseif attempted and humanoid.WalkSpeed > 0 and not root.Anchored
+            and now - progressAt >= 0.45 then
+            -- Net horizontal displacement, rather than input or small jitter,
+            -- determines progress. Include native-controller commands too.
             failedHeadings[#failedHeadings + 1] = {
-                direction = lastCommandDir, untilAt = now + 0.8,
+                direction = attempted, untilAt = now + 1.2,
             }
             failedThisFrame = true
             committedDir, commitUntil, routeDir = nil, 0, nil
             progressPos, progressAt, lastScanAt = root.Position, now, -math.huge
             context.V6RoomEntry.failedMoves = (context.V6RoomEntry.failedMoves or 0) + 1
+        elseif not attempted or humanoid.WalkSpeed <= 0 or root.Anchored then
+            progressPos, progressAt = root.Position, now
         end
         local pingS = context.RT and (context.RT.pingS or context.RT.dataPingS) or 0
         local pingLead = math.clamp((tonumber(pingS) or 0) + 0.16, 0, 0.60)
@@ -166506,7 +166511,7 @@ do
             if not context.projectileImpact then return math.huge, math.huge, math.huge end
             return context.projectileImpact(root.Position, direction, math.max(humanoid.WalkSpeed, 12), horizon or 1.25)
         end
-        local stalled = failedThisFrame or now - progressAt >= 0.25
+        local stalled = failedThisFrame or now - progressAt >= 0.45
         local wasWaiting = context.V6RoomEntry.waiting == true
         -- Do not compete with the game's normal movement controller while it
         -- is already carrying us through a safe lane. The watchdog only takes
@@ -166771,7 +166776,7 @@ do
                 end
                 if not hardUnsafe and score < bestScore then best, bestScore = candidate, score end
             end
-            if bestScore == math.huge and physicalChoices == 0 then
+            if bestScore == math.huge then
                 -- A 13-stud straight corridor is not required to take one
                 -- safe step around a nearby corner. Try short body-width
                 -- corridors before declaring that all movement is blocked.
