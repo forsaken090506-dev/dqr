@@ -51982,6 +51982,9 @@ components.movementCombat = function(context)
         end
     end
     local function buffSeen()
+        capturedContext[2].qSentAt = nil
+        capturedContext[2].qActiveUntil = 0
+        capturedContext[2].lastQ = -math.huge
         movement.controlsOff = false
         movement.controlsAt = 0
         movement.stallLogged = false
@@ -69696,16 +69699,6 @@ components.movementCombat = function(context)
     end
     local function helper42(argument)
         local value = {}
-        if argument == Enum.KeyCode.Q then
-            -- Publish the Q window at the shared sender as well as in the
-            -- higher-level attack helpers. This covers caster and boss paths
-            -- that send Q directly and otherwise left E without a handoff.
-            local qWindow = tonumber(capturedContext[1].qActiveFor) or 8
-            local qUntil = os.clock() + qWindow
-            if qUntil > (capturedContext[2].qActiveUntil or 0) then
-                capturedContext[2].qActiveUntil = qUntil
-            end
-        end
         -- E is a follow-up to Q. Keep the check at the actual key sender so
         -- every attack branch obeys the same active-Q rule.
         if argument == Enum.KeyCode.E then
@@ -69716,6 +69709,12 @@ components.movementCombat = function(context)
             if now > qUntil and now - qAt > qWindow then
                 return false
             end
+            if capturedContext[2].qSentAt and now < capturedContext[2].qSentAt + 0.06 then
+                return false
+            end
+            local character = localPlayer.Character
+            local busy = character and character:FindFirstChild("busyCasting")
+            if busy and busy.Value then return false end
         end
         if capturedContext[2].bugKey then
             local protectedCall, bugKey, value2 =
@@ -69739,7 +69738,9 @@ components.movementCombat = function(context)
             return false
         end
         if argument == Enum.KeyCode.Q or argument == Enum.KeyCode.E then
-            if context.gsOpenerHold then
+            -- Q already opened the attack; E must not wait for another
+            -- pack-gathering/opener cycle while Q's active window is running.
+            if context.gsOpenerHold and argument ~= Enum.KeyCode.E then
                 if not (context.gsIsBuffKey and context.gsIsBuffKey(argument)) then
                     if
                         not (
@@ -69866,6 +69867,11 @@ components.movementCombat = function(context)
             end
         end
         helper41(virtualInputManager.SendKeyEvent, true, argument, false, game)
+        if argument == Enum.KeyCode.Q then
+            capturedContext[2].qSentAt = os.clock()
+            capturedContext[2].qActiveUntil = os.clock()
+                + (tonumber(capturedContext[1].qActiveFor) or 8)
+        end
         value[5] = capturedContext[2]
         value[6] = capturedContext[2].keyDown or {}
         value[5].keyDown = value[6]
@@ -69905,6 +69911,43 @@ components.movementCombat = function(context)
             context.castWatch(argument == Enum.KeyCode.Q and "q" or "e", os.clock())
         end
         return true
+    end
+    context.eFollowupTick = function(now)
+        local rt, cfg = capturedContext[2], capturedContext[1]
+        if not rt.farmEnabled or rt.destroyed or cfg.autoE == false then return end
+        if not rt.qSentAt or now < rt.qSentAt + 0.06
+            or now > math.min(rt.qActiveUntil or 0,
+                rt.qSentAt + (tonumber(cfg.qActiveFor) or 8)) then return end
+        local qCd = context.slotCd and context.slotCd("q")
+        local confirmed = (tonumber(qCd) or 0) > 0
+            or (rt.castOk and (rt.castOk.q or -math.huge) >= rt.qSentAt - 0.01)
+        if not confirmed then return end
+        if now - (rt.eFollowupAt or -math.huge) < 0.08 then return end
+        if not context.slotReady("e") then return end
+        if rt.keyDown and (rt.keyDown[Enum.KeyCode.Q] or rt.keyDown[Enum.KeyCode.E]) then return end
+        local character = localPlayer.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        local busy = character and character:FindFirstChild("busyCasting")
+        local target = combatBrain.target
+        if not humanoid or humanoid.Health <= 0 or not root or not target
+            or not target.root or not target.root.Parent then return end
+        if target.humanoid and target.humanoid.Health <= 0 then return end
+        if busy and busy.Value then return end
+        if context.castHold and context.castHold(now) then return end
+        if context.attackAllowedBySkill and not context.attackAllowedBySkill(now) then return end
+        if context.canHit and not context.canHit(root.Position, target) then return end
+        rt.eFollowupAt = now
+        -- Shared sender retains range, facing, swap, and LOOK AWAY checks.
+        if helper42(Enum.KeyCode.E) then
+            rt.lastE = now
+            rt.castQueue = rt.castQueue or {}
+            rt.castQueue[#rt.castQueue + 1] = {
+                slot = "e", at = now, pos = root.Position,
+                targetPos = combatBrain.aim or target.root.Position,
+            }
+            while #rt.castQueue > 4 do table.remove(rt.castQueue, 1) end
+        end
     end
     context.gsIsBuffKey = function(gsBuffKeys)
         local value = {}
@@ -165638,6 +165681,9 @@ components.interfaceMainLoop = function(context)
         helper233("buffs", context.buffTick, value)
         helper233("brain", helper235, value)
         helper233("caster", context.casterTick, value)
+        if context.eFollowupTick then
+            helper233("e-followup", context.eFollowupTick, value)
+        end
         helper233("face", context.faceTick, value)
         -- The safety arbiter must see the result of every native override,
         -- including red/orb pushes, instead of racing a separate render loop.
@@ -165785,7 +165831,7 @@ do
     local sensedRoots, sensorAt = {}, -math.huge
     local forcedLook = false
     local savedAutoRotate = true
-    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-22-release-cleared-retreat" }
+    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-22-prompt-e-live-floor" }
     -- Run after render/player input and immediately before physical movement.
     local motionSignal = runService.PreSimulation or runService.RenderStepped or runService.Heartbeat
     _G.HL_V6_CONTROLLER_REPORT = context.V6RoomEntry
@@ -165865,10 +165911,12 @@ do
         local function routeDanger(x, y, z, lead)
             local live = context.dangerAt(x, y, z, lead)
             local predicted = context.dangerAt(x, y, z, lead + pingLead)
-            if type(live) ~= "number" or type(predicted) ~= "number" then
+            local activeNow = context.dangerAt(x, y, z, 0)
+            if type(live) ~= "number" or type(predicted) ~= "number"
+                or type(activeNow) ~= "number" then
                 return math.huge
             end
-            return math.max(live, predicted)
+            return math.max(live, predicted, activeNow), activeNow
         end
         -- Reapply after native/spell resets, before prediction uses the speed.
         -- Respect an actual game hold rather than walking out of a stun.
@@ -166064,7 +166112,10 @@ do
         local riskLimit = enemyEmergency and 0.12 or (enemyTooClose and 0.16 or 0.24)
         -- A wide lane may take more than half a second to leave at speed 22.
         -- Use one horizon for validation, escape scoring and retreat checks.
-        local routeSamples = {0.03, 0.07, 0.12, 0.20, 0.32, 0.52, 0.75, 1.0, 1.25}
+        local routeSamples = {0.03}
+        -- At speed 27 the old gaps could skip a narrow active strip.
+        -- Sample every 0.05 seconds (at most 1.35 studs between probes).
+        for index = 1, 25 do routeSamples[#routeSamples + 1] = index * 0.05 end
         local function enemyDistance(point, lead)
             local closest = math.huge
             for _, enemy in ipairs(nearbyEnemies) do
@@ -166154,7 +166205,7 @@ do
                     and forwardClearance >= math.min(38, currentClearance) - 0.5)
             if currentSafe and forwardSafe and enemyLaneSafe and not orbTooClose
                 and not stalled and not wasWaiting and not failedHeading(heading, now)
-                and laneOpen(heading, false) then
+                and laneOpen(heading, true) then
                 -- Once danger has cleared, approaching the next target is
                 -- legitimate progress, even when it reverses the old dodge.
                 committedDir, commitUntil, routeDir = nil, 0, nil
@@ -166214,8 +166265,7 @@ do
             and moving and not failedHeading(humanoid.MoveDirection, now)
             and (not lastCommandDir or now - lastOwnedAt > 0.75
                 or humanoid.MoveDirection.Unit:Dot(lastCommandDir) >= 0)
-            and laneOpen(humanoid.MoveDirection,
-                movementState:sub(1, 7) == "ESCAPE ") then
+            and laneOpen(humanoid.MoveDirection, true) then
             committedDir, commitUntil, routeDir = nil, 0, nil
             idleAt = now
             return
@@ -166233,6 +166283,7 @@ do
         end
         lastScanAt = now
         local dir
+        local activeFloorTrapped = false
         local brain = context.BR
         local goal = brain and (brain.goTo or brain.target and brain.target.root and brain.target.root.Position)
         if goal then
@@ -166251,6 +166302,10 @@ do
             local basis = dir.Unit
             local best, bestScore = basis, math.huge
             local fallback, fallbackScore, fallbackExit = nil, math.huge, math.huge
+            local activeOk, activeStart = pcall(context.dangerAt,
+                root.Position.X, root.Position.Y, root.Position.Z, 0)
+            local startsClear = activeOk and type(activeStart) == "number" and activeStart < riskLimit
+            local activeBlocked = 0
             for index = 0, 15 do
                 local angle = index * math.pi / 8
                 local c, s = math.cos(angle), math.sin(angle)
@@ -166267,6 +166322,7 @@ do
                 end
                 local hardUnsafe = false
                 local lastUnsafe = 0
+                local activeCleared, crossesActive = startsClear, false
                 local physicalOpen = laneOpen(candidate, false)
                 -- Reject escape headings that cannot physically carry the
                 -- avatar clear. This is the wall-trap shown in the 17:14
@@ -166280,13 +166336,20 @@ do
                     local hazardLead = travelLead + pingLead
                     local point = root.Position
                         + candidate * math.max(humanoid.WalkSpeed, 12) * travelLead
-                    local ok, risk = pcall(
+                    local ok, risk, activeRisk = pcall(
                         routeDanger,
                         point.X,
                         point.Y,
                         point.Z,
                         travelLead
                     )
+                    if type(activeRisk) == "number" then
+                        if activeRisk < riskLimit then
+                            activeCleared = true
+                        elseif activeCleared then
+                            crossesActive = true
+                        end
+                    end
                     if not ok or type(risk) ~= "number" then
                         score = math.huge
                         break
@@ -166349,7 +166412,8 @@ do
                 -- If already inside an attack, every heading shares an unsafe
                 -- prefix. Prefer the open lane that clears it earliest; never
                 -- select a wall merely because all hazard scores are large.
-                if physicalOpen and score < math.huge and (
+                if physicalOpen and crossesActive then activeBlocked = activeBlocked + 1 end
+                if physicalOpen and not crossesActive and score < math.huge and (
                     lastUnsafe < fallbackExit
                     or lastUnsafe == fallbackExit and score < fallbackScore
                 ) then
@@ -166379,6 +166443,7 @@ do
                     return -- no cooldown: re-score every frame until a route opens
                 end
                 best = fallback
+                activeFloorTrapped = not fallback and startsClear and activeBlocked > 0
                 context.V6RoomEntry.fallbackExit = fallbackExit
             end
             -- Commit to the first safe escape lane for the attack sequence.
@@ -166434,7 +166499,12 @@ do
         end
         if not dir then
             committedDir, commitUntil, routeDir = nil, 0, nil
-            return -- leave existing wall recovery in control
+            if activeFloorTrapped then
+                context.V6RoomEntry.waiting = true
+                lastCommandDir = nil
+                applyCommand(Vector3.zero, "wait: active floor blocks all exits")
+            end
+            return -- recheck waiting each frame; physical wall recovery otherwise stays native
         end
         if dir.Magnitude > 0.01 then
             context.V6RoomEntry.waiting = false
