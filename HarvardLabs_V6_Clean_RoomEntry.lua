@@ -165709,6 +165709,11 @@ components.interfaceMainLoop = function(context)
         helper233("config", context.autosaveTick, value)
         helper233("range", context.judgeCasts, value)
         helper233("buffs", context.buffTick, value)
+        -- Retry a confirmed Q follow-up before expensive combat planning.
+        -- The later pass still handles a newly opened Q window.
+        if context.eFollowupTick then
+            helper233("e-followup-early", context.eFollowupTick, value)
+        end
         helper233("brain", helper235, value)
         helper233("caster", context.casterTick, value)
         if context.eFollowupTick then
@@ -165861,7 +165866,7 @@ do
     local sensedRoots, sensorAt = {}, -math.huge
     local forcedLook = false
     local savedAutoRotate = true
-    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-23-refuge-priority-environment" }
+    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-23-latency-work-reduction" }
     -- Run after render/player input and immediately before physical movement.
     local motionSignal = runService.PreSimulation or runService.RenderStepped or runService.Heartbeat
     _G.HL_V6_CONTROLLER_REPORT = context.V6RoomEntry
@@ -165942,6 +165947,11 @@ do
             return context.dangerAt(x, y, z, lead, nil, nil, nil, true)
         end
         local function routeDanger(x, y, z, lead)
+            if lead == 0 then
+                local active = strictDanger(x, y, z, 0)
+                local predicted = strictDanger(x, y, z, pingLead)
+                return math.max(active, predicted), active
+            end
             local live = strictDanger(x, y, z, lead)
             local predicted = strictDanger(x, y, z, lead + pingLead)
             local activeNow = strictDanger(x, y, z, 0)
@@ -166380,6 +166390,7 @@ do
                     hardUnsafe = true
                 end
                 for _, travelLead in ipairs(routeSamples) do
+                    if not physicalOpen then break end
                     local hazardLead = travelLead + pingLead
                     local point = root.Position
                         + candidate * math.max(humanoid.WalkSpeed, 12) * travelLead
@@ -166601,7 +166612,11 @@ do
         end
     end
     context.v6FinalizeMovement = function(phase)
+        local started = os.clock()
         local ok, err = pcall(controllerTick, phase)
+        local report = context.V6RoomEntry
+        report.lastWorkMs = (os.clock() - started) * 1000
+        report.maxWorkMs = math.max(report.maxWorkMs or 0, report.lastWorkMs)
         if not ok then
             local report = context.V6RoomEntry
             report.errors = (report.errors or 0) + 1
