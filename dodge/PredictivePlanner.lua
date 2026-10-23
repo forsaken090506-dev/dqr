@@ -103,7 +103,7 @@ function Planner:command(e,reason)
     local dx,dz=unit(e,route.points[1])
     self.lastMove={x=dx,z=dz}
     return {kind='move',dx=dx,dz=dz,route=route.id,target=route.points[1],reason=reason,
-        holdAttack=e.mode~='refuge' or e.risk(e.x,e.z,0)>=0.12 or (e.enemy and e.enemy(e.x,e.z,0)<12)}
+        holdAttack=self.route.defensive or e.risk(e.x,e.z,0)>=0.12 or (e.enemy and e.enemy(e.x,e.z,0)<12)}
 end
 function Planner:cancel(e,reason)
     local route=self.route
@@ -183,8 +183,17 @@ end
 -- If no complete route can be proved, take only a checked short prefix.
 -- This cannot enter a new hazard from clear ground or cross a projectile;
 -- it can continue leaving the hazard already under the character.
-function Planner:escapePrefix(e)
-    if self:evaluate(e,{},0.25) then return nil end
+function Planner:escapePrefix(e,preferMotion)
+    if not preferMotion and self:evaluate(e,{},0.25) then return nil end
+    if preferMotion and self.lastMove then
+        local point={x=e.x+self.lastMove.x*3.24,z=e.z+self.lastMove.z*3.24}
+        local banned=false
+        for _,bad in ipairs(self.blocked) do
+            if e.now<bad.untilAt and dist(point,bad)<1.2 then banned=true break end
+        end
+        local result=not banned and self:evaluate(e,{point},0)
+        if result and result.lastRisk<0.12 then return point end
+    end
     local best,bestScore
     for _,radius in ipairs({3.24,1.62}) do
         for i=0,31 do
@@ -205,6 +214,13 @@ function Planner:escapePrefix(e)
         if best then break end
     end
     return best
+end
+function Planner:beginPrefix(e,prefix)
+    self.serial=self.serial+1
+    self.route={id=self.serial,points={prefix},created=e.now,prefix=true,defensive=self.defensive}
+    self.progress={x=e.x,z=e.z,at=e.now}
+    self:log(e,'commit checked escape prefix',{targetX=prefix.x,targetZ=prefix.z})
+    return self:command(e,'continuous checked step; full route unavailable')
 end
 function Planner:step(e)
     if e.modeKey~=self.modeKey then
@@ -255,15 +271,23 @@ function Planner:step(e)
         return {kind='hold',reason='aligned in checked row opening',holdAttack=false}
     end
     local specialized=e.mode=='entry' or e.mode=='refuge' or e.mode=='rows'
+    local preferMotion=e.mode=='entry' or e.mode=='refuge'
+        or (e.mode~='rows' and (e.combat or enemy<28))
+    self.defensive=not safeNative or enemy<20 or e.mode=='entry' or e.mode=='rows'
+
     -- Do not turn clean dungeon travel into constant evasion. Native room
     -- navigation remains responsible for long paths and doorway traversal.
-    if not specialized and safeNative and enemy>=28 then
+    if not specialized and safeNative and enemy>=28 and (not preferMotion or nativeLength>0.05) then
         self.nextPlan=0
         if e.recoverNavigation and nativeLength>0.05 then
             return {kind='navigate',dx=native.x/nativeLength,dz=native.z/nativeLength,
                 reason='checked navigation recovery'}
         end
         return {kind='yield',reason='checked native navigation'}
+    end
+    if e.now<self.nextPlan and preferMotion then
+        local prefix=self:escapePrefix(e,true)
+        if prefix then return self:beginPrefix(e,prefix) end
     end
     if e.now<self.nextPlan and self:evaluate(e,{},self.nextPlan-e.now) then
         return {kind='hold',reason='checked wait; retry pending',holdAttack=false}
@@ -272,19 +296,13 @@ function Planner:step(e)
     local points,cost=self:choose(e)
     if points then
         self.serial=self.serial+1
-        self.route={id=self.serial,points=points,created=e.now}
+        self.route={id=self.serial,points=points,created=e.now,defensive=self.defensive}
         self.progress={x=e.x,z=e.z,at=e.now}
         self:log(e,'commit', {cost=cost,targetX=points[#points].x,targetZ=points[#points].z,waypoints=#points})
         return self:command(e,'new predicted path')
     end
-    local prefix=self:escapePrefix(e)
-    if prefix then
-        self.serial=self.serial+1
-        self.route={id=self.serial,points={prefix},created=e.now,prefix=true}
-        self.progress={x=e.x,z=e.z,at=e.now}
-        self:log(e,'commit checked escape prefix',{targetX=prefix.x,targetZ=prefix.z})
-        return self:command(e,'short checked escape; full route unavailable')
-    end
+    local prefix=self:escapePrefix(e,preferMotion)
+    if prefix then return self:beginPrefix(e,prefix) end
     if e.now-self.lastLog>=0.25 then
         self.lastLog=e.now
         self:log(e,'no checked route',{rejects=self.lastRejects})
