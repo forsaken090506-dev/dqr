@@ -166636,6 +166636,16 @@ do
             end
             return true
         end
+        local function wallRoom(point)
+            local closest = 12
+            for i = 0, 7 do
+                local angle = i * math.pi / 4
+                local hit = (context.Workspace or workspace):Raycast(point + Vector3.new(0, 1.5, 0),
+                    Vector3.new(math.cos(angle), 0, math.sin(angle)) * 12, rayParams)
+                if hit then closest = math.min(closest, hit.Distance) end
+            end
+            return closest
+        end
         local function projectileImpact(direction, horizon)
             if not context.projectileImpact then return math.huge, math.huge, math.huge end
             return context.projectileImpact(root.Position, direction, math.max(humanoid.WalkSpeed, 12), horizon or 1.25)
@@ -166806,7 +166816,14 @@ do
                 end
                 local activeCleared, crossesActive = startsClear, false
                 local physicalOpen = laneOpen(candidate, false)
-                if physicalOpen then physicalChoices = physicalChoices + 1 end
+                if physicalOpen then
+                    physicalChoices = physicalChoices + 1
+                    -- Reserve turning space before the pack pins us against
+                    -- a wall. Only ranks physically open candidates; hazard
+                    -- and projectile exclusions still determine eligibility.
+                    local room = wallRoom(root.Position + candidate * 8)
+                    score = score + math.max(0, 10 - room) ^ 2 * 3
+                end
                 -- Reject escape headings that cannot physically carry the
                 -- avatar clear. This is the wall-trap shown in the 17:14
                 -- recording: dangerAt saw empty space beyond the wall and the
@@ -166919,8 +166936,13 @@ do
                         local point = root.Position + candidate * 3.5
                         local currentDistance = enemyDistance(root.Position)
                         local futureDistance = enemyDistance(point, 3.5 / math.max(humanoid.WalkSpeed, 12) + pingLead)
-                        if futureDistance >= math.min(30, currentDistance) - 0.5 then
+                        if futureDistance >= math.min(8, currentDistance) - 0.5 then
+                            -- A wall slide may briefly reduce the broad melee
+                            -- buffer. Keep a hard body clearance and rank by
+                            -- separation instead of vetoing every tangent.
                             local score = (1 - candidate:Dot(basis)) * 0.35
+                                + math.max(0, 30 - futureDistance) ^ 2 * 1.2
+                                + math.max(0, 10 - wallRoom(point)) ^ 2 * 3
                                 + (failedHeading(candidate, now) and 25000 or 0)
                             if lastCommandDir then
                                 local turn = 1 - math.clamp(candidate:Dot(lastCommandDir), -1, 1)
@@ -166958,27 +166980,8 @@ do
                 activeFloorTrapped = not fallback and startsClear and activeBlocked > 0
                 context.V6RoomEntry.fallbackExit = fallbackExit
             end
-            -- Commit to the first safe escape lane for the attack sequence.
-            -- Replanning on every fractional risk change caused late zigzags;
-            -- abandon the commitment only when the lane itself is lethal.
-            if committedDir and now < commitUntil then
-                local travelLead = 0.35
-                local hazardLead = travelLead + pingLead
-                local probe = root.Position
-                    + committedDir * math.max(humanoid.WalkSpeed, 12) * travelLead
-                local probeOk, probeRisk = pcall(
-                    routeDanger,
-                    probe.X,
-                    probe.Y,
-                    probe.Z,
-                    travelLead
-                )
-                if probeOk and type(probeRisk) == "number" and probeRisk < riskLimit then
-                    best = committedDir
-                else
-                    committedDir, commitUntil = nil, 0
-                end
-            end
+            -- Established lanes were fully revalidated above. Do not replace
+            -- this newly checked selection using only one endpoint sample.
             dir = best
         end
         -- Hard melee keep-out: once an enemy breaches the inner envelope,
@@ -167006,7 +167009,7 @@ do
                 local retreat = Vector3.new(awayX, 0, awayZ).Unit
                 -- Never replace a fully checked dodge with a retreat that
                 -- crosses a live floor attack or runs into room geometry.
-                if not failedHeading(retreat, now) and laneOpen(retreat, true)
+                if not dir and not failedHeading(retreat, now) and laneOpen(retreat, true)
                     and projectileImpact(retreat) == math.huge then dir = retreat end
             end
         end
