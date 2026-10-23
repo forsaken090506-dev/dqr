@@ -2,7 +2,7 @@
 return function(context, Planner)
     local rt, world, player = context.RT, context.Workspace, context.LocalPlayer
     local planner=Planner.new()
-    local report={build='V7-predictive-waypoints-4-continuous-handoff',frames=0,errors=0,decisions={},healthEvents={}}
+    local report={build='V7-predictive-waypoints-5-circle-exits',frames=0,errors=0,decisions={},healthEvents={}}
     local character, rays, lastNative, wasOwned, lastCall=nil,nil,nil,false,-math.huge
     local lastHealth, lastMode, lastSpot=nil,nil,nil
     local lastRowsAt, nativeIdleAt=-math.huge,os.clock()
@@ -198,6 +198,33 @@ return function(context, Planner)
             if context.gsB1Lanes and context.gsB1Lanes(now) then lastRowsAt=now end
             if now-lastRowsAt<0.5 then mode,modeKey='rows','rows' end
         end
+        local circles,circleDanger={},false
+        if bossPresent then
+            for part,entry in pairs(context.RD and context.RD.models or {}) do
+                if entry.name=='gs circle' and not entry.fired and part.Parent and part:IsA('BasePart') then
+                    local expires=(entry.untilAt or (entry.spawn or now)+1.6)-now
+                    local size=part.Size
+                    local lo,hi=math.min(size.X,size.Y,size.Z),math.max(size.X,size.Y,size.Z)
+                    local radius=(size.X+size.Y+size.Z-lo-hi)/2
+                        +(context.DG and context.DG.reach or 2)+2
+                    local dx,dz=pos.X-part.Position.X,pos.Z-part.Position.Z
+                    if expires>0 and dx*dx+dz*dz<(radius+30)^2 and math.abs(part.Position.Y-pos.Y)<14 then
+                        circles[#circles+1]={x=part.Position.X,z=part.Position.Z,r=radius,expires=expires}
+                        if dx*dx+dz*dz<radius*radius then circleDanger=true end
+                        if #circles>=10 then break end
+                    end
+                end
+            end
+        end
+        table.sort(circles,function(a,b)
+            local da=math.sqrt((pos.X-a.x)^2+(pos.Z-a.z)^2)-a.r
+            local db=math.sqrt((pos.X-b.x)^2+(pos.Z-b.z)^2)-b.r
+            return da<db
+        end)
+        if circleDanger and not activeRefuge then
+            mode,modeKey='circles','circles'
+        end
+        report.circleWarnings=#circles
         if not goal and mode=='normal' then
             local brain=context.BR
             local g=brain and (brain.goTo or brain.target and brain.target.root and brain.target.root.Position)
@@ -227,7 +254,7 @@ return function(context, Planner)
         local ping=tonumber(rt.pingS or rt.dataPingS) or 0
         if ping>2 then ping=ping/1000 end
         local margin=math.clamp(ping*0.5+0.04,0.04,0.2)
-        local e={now=now,x=pos.X,z=pos.Z,speed=27,mode=mode,modeKey=modeKey,goal=goal,circle=circle,combat=bossPresent,
+        local e={now=now,x=pos.X,z=pos.Z,speed=27,mode=mode,modeKey=modeKey,goal=goal,circle=circle,combat=bossPresent,circles=circles,circleDanger=circleDanger,
             native=lastNative and now-lastNative.at<0.25 and lastNative or {x=0,z=0}}
         if mode=='normal' and goal and now-nativeIdleAt>0.45 then
             local dx,dz=goal.x-pos.X,goal.z-pos.Z
