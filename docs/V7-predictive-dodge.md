@@ -5,6 +5,7 @@ The existing `HarvardLabs_V6_Clean_RoomEntry.lua` loader now embeds a new planne
 ## Behavior
 
 - Plans a destination and a timed route, including a short safe interval after arrival.
+- First-boss red-circle warnings reject destinations still inside their future footprints. Adds rim and overlapping-circle intersection candidates, checks activation timing, and replaces a committed destination if a new circle covers it.
 - Follows waypoints rather than rescoring opposite headings every frame.
 - During combat, joins waypoint and retry transitions using checked short moving steps when available, rather than inserting a hold because no complete route passes its destination dwell check. Safe row-opening holds remain deliberate. Proactive movement alone does not suspend offensive casts.
 - Cancels for walls, missing floor, imminent attacks/projectiles, an enemy interception, a mechanic transition, or 0.45 seconds without physical progress.
@@ -39,4 +40,4 @@ python -m unittest discover -s tests -v
 
 Edit `dodge/PredictivePlanner.lua` and `dodge/RobloxAdapter.lua`, then regenerate the embedded controller. The planner is pure Lua and can be tested independently of Roblox. The adapter is exercised with mocked services, vector operations, native-controller handoffs, movement holds and disable behavior. Projectile regression tests extract the actual predictor from the full loader, including future start times for second route segments.
 
-The suite currently contains 30 test methods. The projectile test covers nine swept-geometry cases. These are isolated and mocked tests, not a successful live hardcore run. Detection still depends on the existing hazard reader, and unrecognized attacks, network delay, server corrections or genuinely blocked routes can still cause failure. No zero-death guarantee is implied.
+The suite currently contains 35 test methods. The projectile test covers nine swept-geometry cases. These are isolated and mocked tests, not a successful live hardcore run. Detection still depends on the existing hazard reader, and unrecognized attacks, network delay, server corrections or genuinely blocked routes can still cause failure. No zero-death guarantee is implied.
