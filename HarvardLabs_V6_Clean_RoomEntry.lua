@@ -94739,6 +94739,59 @@ components.movementCombat = function(context)
                 value8
             )
     end
+    -- Earliest intersection with recognized moving dungeon hazards. This
+    -- uses their path geometry directly and does not depend on living mobs.
+    context.projectileImpact = function(origin, direction, speed, horizon)
+        local now = os.clock()
+        local lead = math.clamp(tonumber(capturedContext[2].pingS or capturedContext[2].dataPingS) or 0, 0, 0.6) + 0.12
+        local earliest, earliestExit, actualEntry = math.huge, math.huge, math.huge
+        local body = (context.DG and context.DG.reach or 2) + 1.5
+        for _, box in ipairs(context.DG and context.DG.boxes or {}) do
+            if box.moving and not box.far and type(box.speed) == "number"
+                and type(box.dx) == "number" and type(box.dz) == "number"
+                and type(box.ox) == "number" and type(box.oz) == "number"
+                and now <= (box.untilAt or now)
+                and (box.ground or not box.oy or math.abs(origin.Y - box.oy)
+                    <= (box.halfH or 4) + (context.DG and context.DG.halfHeight or 4)) then
+                local launch = math.max(box.pathStart or now, now)
+                local wait = launch - now
+                local offset = (box.offset or 0) + box.speed * math.max(now - (box.pathStart or now), 0)
+                local pathSpeed = box.speed
+                local stopIn = math.huge
+                if box.endAlong then
+                    offset = math.min(offset, box.endAlong)
+                    if offset >= box.endAlong then pathSpeed = 0
+                    elseif box.speed > 0 then stopIn = (box.endAlong - offset) / box.speed end
+                end
+                local px, pz = box.ox + box.dx * offset, box.oz + box.dz * offset
+                local rx = origin.X + direction.X * speed * wait - px
+                local rz = origin.Z + direction.Z * speed * wait - pz
+                local along = rx * box.dx + rz * box.dz
+                local across = -rx * box.dz + rz * box.dx
+                local va = speed * (direction.X * box.dx + direction.Z * box.dz) - pathSpeed
+                local vc = speed * (-direction.X * box.dz + direction.Z * box.dx)
+                local enter, leave = 0, math.min(horizon + lead - wait, (box.untilAt or now + horizon + lead) - launch, stopIn)
+                local function slab(position, velocity, half)
+                    if math.abs(velocity) < 0.001 then return math.abs(position) <= half end
+                    local a, b = (-half - position) / velocity, (half - position) / velocity
+                    if a > b then a, b = b, a end
+                    enter, leave = math.max(enter, a), math.min(leave, b)
+                    return enter <= leave
+                end
+                local width = (box.r or box.halfW or 1) + body
+                local length = (box.r or box.halfL or 1) + body
+                if leave >= 0 and slab(along, va, length) and slab(across, vc, width)
+                    and leave >= 0 and enter <= leave then
+                    local impact = math.max(0, wait + enter - lead)
+                    if impact <= horizon and (impact < earliest
+                        or impact == earliest and wait + leave < earliestExit) then
+                        earliest, earliestExit, actualEntry = impact, math.max(0, wait + leave), wait + enter
+                    end
+                end
+            end
+        end
+        return earliest, earliestExit, actualEntry
+    end
     context.archRefugeCircle = function(humanoid, root, spot, field, now)
         local rt = capturedContext[2]
         local orbit = rt.archRefugeOrbit
@@ -94766,7 +94819,7 @@ components.movementCombat = function(context)
             orbit.rays.FilterDescendantsInstances = {localPlayer.Character}
             orbit.rays.RespectCanCollide = true
         end
-        local best, bestSign, bestScore = nil, orbit.sign, math.huge
+        local best, bestSign, bestScore, bestPoint = nil, orbit.sign, math.huge, nil
         local function consider(point, sign, preference)
             local delta = Vector3.new(point.X - root.Position.X, 0, point.Z - root.Position.Z)
             if delta.Magnitude < 0.2 then return end
@@ -94776,6 +94829,8 @@ components.movementCombat = function(context)
             local endpoint = root.Position + direction * distance
             local ex, ez = endpoint.X - spot.x, endpoint.Z - spot.z
             if ex * ex + ez * ez > inset * inset then return end
+            local impact, exit, actualEntry = context.projectileImpact(root.Position, direction, speed, distance / speed)
+            if impact < math.huge and (actualEntry > 0 or exit > distance / speed) then return end
             local side = Vector3.new(-direction.Z, 0, direction.X)
             for _, offset in ipairs({0, -1.5, 1.5}) do
                 if workspaceService:Raycast(root.Position + Vector3.new(0, 1.5, 0) + side * offset,
@@ -94799,8 +94854,16 @@ components.movementCombat = function(context)
             end
             if not cleared then return end
             local score = exposure * 100 + preference + (sign == orbit.sign and 0 or 0.2)
-            if score < bestScore then best, bestSign, bestScore = direction, sign, score end
+            if score < bestScore then best, bestSign, bestScore, bestPoint = direction, sign, score, point end
         end
+        -- Retain a checked short arc despite small score changes. Every
+        -- frame still rechecks hazards, projectile interception and walls.
+        if orbit.point and now < (orbit.holdUntil or 0)
+            and (orbit.point - root.Position).Magnitude > speed * 0.04 then
+            consider(orbit.point, orbit.sign, 0)
+        end
+        local retained = best ~= nil
+        if not retained then
         for _, sign in ipairs({orbit.sign, -orbit.sign}) do
             for index, advance in ipairs({0.45, 0.8, 1.2, 1.8}) do
                 local targetAngle = angle + sign * advance
@@ -94810,6 +94873,7 @@ components.movementCombat = function(context)
         end
         -- A clear inward chord is preferable to stopping under an attack.
         consider(Vector3.new(spot.x, root.Position.Y, spot.z), orbit.sign, 0.3)
+        end
         movement.cmdDir = best
         movement.cmdAt = rt.brainNow or now
         movement.driving = best ~= nil
@@ -94817,8 +94881,10 @@ components.movementCombat = function(context)
         humanoid:Move(best or Vector3.zero, false)
         if best then
             orbit.sign = bestSign
+            if not retained then orbit.point, orbit.holdUntil = bestPoint, now + 0.18 end
             setState("SAFE SPOT: circling inside first-boss refuge")
         else
+            orbit.point, orbit.holdUntil = nil, 0
             setState("SAFE SPOT: waiting inside refuge for a clear circle path")
         end
         return true
@@ -165964,7 +166030,7 @@ do
     local sensedRoots, sensorAt = {}, -math.huge
     local forcedLook = false
     local savedAutoRotate = true
-    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-23-confined-refuge-orbit" }
+    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-23-projectile-priority-stability" }
     -- Run after render/player input and immediately before physical movement.
     local motionSignal = runService.PreSimulation or runService.RenderStepped or runService.Heartbeat
     _G.HL_V6_CONTROLLER_REPORT = context.V6RoomEntry
@@ -166322,6 +166388,10 @@ do
             end
             return true
         end
+        local function projectileImpact(direction, horizon)
+            if not context.projectileImpact then return math.huge, math.huge, math.huge end
+            return context.projectileImpact(root.Position, direction, math.max(humanoid.WalkSpeed, 12), horizon or 1.25)
+        end
         local stalled = failedThisFrame or now - progressAt >= 0.25
         local wasWaiting = context.V6RoomEntry.waiting == true
         -- Do not compete with the game's normal movement controller while it
@@ -166358,7 +166428,7 @@ do
                     and forwardClearance >= math.min(38, currentClearance) - 0.5)
             if currentSafe and forwardSafe and enemyLaneSafe and not orbTooClose
                 and not stalled and not wasWaiting and not failedHeading(heading, now)
-                and laneOpen(heading, true) then
+                and laneOpen(heading, true) and projectileImpact(heading) == math.huge then
                 -- Once danger has cleared, approaching the next target is
                 -- legitimate progress, even when it reverses the old dodge.
                 committedDir, commitUntil, routeDir = nil, 0, nil
@@ -166371,7 +166441,9 @@ do
         -- the whole telegraph. This prevents the combat controller from
         -- steering back toward the enemies halfway through the dodge.
         if committedDir and now < commitUntil and context.dangerAt then
+            local hitAt, exitAt, actualEntry = projectileImpact(committedDir)
             local laneSafe = laneOpen(committedDir, false)
+                and (hitAt == math.huge or actualEntry == 0 and exitAt <= 0.2)
             local initialEnemyDistance = enemyDistance(root.Position)
             local startOk, startRisk = pcall(routeDanger,
                 root.Position.X, root.Position.Y, root.Position.Z, 0)
@@ -166418,7 +166490,8 @@ do
             and moving and not failedHeading(humanoid.MoveDirection, now)
             and (not lastCommandDir or now - lastOwnedAt > 0.75
                 or humanoid.MoveDirection.Unit:Dot(lastCommandDir) >= 0)
-            and laneOpen(humanoid.MoveDirection, true) then
+            and laneOpen(humanoid.MoveDirection, true)
+            and projectileImpact(humanoid.MoveDirection) == math.huge then
             committedDir, commitUntil, routeDir = nil, 0, nil
             idleAt = now
             return
@@ -166476,6 +166549,13 @@ do
                 end
                 local hardUnsafe = false
                 local lastUnsafe = 0
+                local hitAt, exitAt = projectileImpact(candidate)
+                if hitAt < math.huge then
+                    hardUnsafe = true
+                    lastUnsafe = math.min(1.25, exitAt)
+                    -- Earlier incoming impacts dominate ordinary route scores.
+                    score = score + 10000 / (0.05 + hitAt)
+                end
                 local activeCleared, crossesActive = startsClear, false
                 local physicalOpen = laneOpen(candidate, false)
                 if physicalOpen then physicalChoices = physicalChoices + 1 end
@@ -166586,7 +166666,8 @@ do
                     local c, sn = math.cos(angle), math.sin(angle)
                     local candidate = Vector3.new(basis.X * c - basis.Z * sn, 0,
                         basis.X * sn + basis.Z * c)
-                    if laneOpen(candidate, true, 3.5) then
+                    if laneOpen(candidate, true, 3.5)
+                        and projectileImpact(candidate, 3.5 / math.max(humanoid.WalkSpeed, 12)) == math.huge then
                         local point = root.Position + candidate * 3.5
                         local currentDistance = enemyDistance(root.Position)
                         local futureDistance = enemyDistance(point, 3.5 / math.max(humanoid.WalkSpeed, 12) + pingLead)
@@ -166677,7 +166758,8 @@ do
                 local retreat = Vector3.new(awayX, 0, awayZ).Unit
                 -- Never replace a fully checked dodge with a retreat that
                 -- crosses a live floor attack or runs into room geometry.
-                if not failedHeading(retreat, now) and laneOpen(retreat, true) then dir = retreat end
+                if not failedHeading(retreat, now) and laneOpen(retreat, true)
+                    and projectileImpact(retreat) == math.huge then dir = retreat end
             end
         end
         if not dir then
