@@ -94746,13 +94746,13 @@ components.movementCombat = function(context)
     end
     -- Earliest intersection with recognized moving dungeon hazards. This
     -- uses their path geometry directly and does not depend on living mobs.
-    context.projectileImpact = function(origin, direction, speed, horizon)
-        local now = os.clock()
+    context.projectileImpact = function(origin, direction, speed, horizon, startDelay)
+        local now = os.clock() + math.max(0, startDelay or 0)
         local lead = math.clamp(tonumber(capturedContext[2].pingS or capturedContext[2].dataPingS) or 0, 0, 0.6) + 0.12
         local earliest, earliestExit, actualEntry = math.huge, math.huge, math.huge
         local body = (context.DG and context.DG.reach or 2) + 1.5
         for _, box in ipairs(context.DG and context.DG.boxes or {}) do
-            if box.moving and box.weight ~= 0 and not box.far and type(box.speed) == "number"
+            if box.moving and box.weight ~= 0 and type(box.speed) == "number"
                 and type(box.dx) == "number" and type(box.dz) == "number"
                 and type(box.ox) == "number" and type(box.oz) == "number"
                 and now <= (box.untilAt or now)
@@ -117641,6 +117641,12 @@ components.movementCombat = function(context)
                     else
                         value[5] = capturedContext[2]
                         value[5].castReadyAt = nil
+                        return
+                    end
+                    -- V7 gives a moving checked escape priority over offense.
+                    if (capturedContext[2].v7DodgeAttackHold or 0) > aoeScanAt then
+                        capturedContext[2].castReadyAt = nil
+                        capturedContext[2].attackState = "V7: committed survival route"
                         return
                     end
                     -- V4.5: survival-first emergency state. Avoid offensive casts while
@@ -166245,853 +166251,590 @@ startupReport.totalMs = (os.clock() - startupReport.startedAt) * 1000
 context.V4StartupReport = startupReport
 _G.HL_V4_STARTUP_REPORT = startupReport
 print(string.format("[HL V4] %d stages initialized in %.1f ms", #startupReport.stages, startupReport.totalMs))
--- V6 clean room-entry watchdog. This is intentionally independent of the
--- experimental arbitration layer: if farming is active and the avatar has no
--- movement intent for a bounded interval, use the current route/target or the
--- character's facing to leave the entrance. It never runs while dead,
--- destroyed, or during an active escape command.
+-- BEGIN V7 PREDICTIVE DODGE
 do
-    -- Component-local service variables are not in scope here. Bind the
-    -- initialized dependencies explicitly before attaching the controller.
-    local runService = assert(context.RunService, "V6: missing RunService")
-    local localPlayer = assert(context.LocalPlayer, "V6: missing LocalPlayer")
-    local players = assert(context.Players, "V6: missing Players")
-    local idleAt = 0
-    local lastScanAt = 0
-    local lastCharacter = nil
-    local routeDir = nil
-    local failedHeadings = {}
-    local lastCommandDir = nil
-    local lastOwnedAt = -math.huge
-    local failedThisFrame = false
-    local function failedHeading(direction, now)
-        if not direction or direction.Magnitude < 0.01 then return false end
-        for index = #failedHeadings, 1, -1 do
-            local failure = failedHeadings[index]
-            if now >= failure.untilAt then
-                table.remove(failedHeadings, index)
-            elseif direction.Unit:Dot(failure.direction) > 0.8 then
-                return true
-            end
-        end
-        return false
-    end
-    local committedDir = nil
-    local commitUntil = 0
-    local progressPos = nil
-    local progressAt = 0
-    local rayParams = nil
-    local sensedRoots, sensorAt = {}, -math.huge
-    local forcedLook = false
-    local savedAutoRotate = true
-    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-23-stable-dodge-ownership" }
-    -- Run after render/player input and immediately before physical movement.
-    local motionSignal = runService.PreSimulation or runService.RenderStepped or runService.Heartbeat
-    _G.HL_V6_CONTROLLER_REPORT = context.V6RoomEntry
-    local function retainDodgeStep(span, openLane, hitAt, riskAtTime, clearanceAtTime, limit)
-        if not openLane then return false, "wall or stalled heading" end
-        if hitAt < math.huge then return false, "projectile collision" end
-        local startRisk = riskAtTime(0)
-        if type(startRisk) ~= "number" or startRisk ~= startRisk or startRisk == math.huge then return false, "invalid risk or enemy clearance" end
-        local cleared = startRisk < limit
-        local startClearance = clearanceAtTime(0)
-        for index = 1, 6 do
-            local t = span * index / 6
-            local risk = riskAtTime(t)
-            if type(risk) ~= "number" or risk ~= risk or risk == math.huge then return false, "invalid risk or enemy clearance" end
-            if risk < limit then
-                cleared = true
-            elseif cleared or risk > startRisk + 0.01 then
-                return false, "attack intersects committed step"
-            end
-            if clearanceAtTime(t) < math.min(12, startClearance) - 0.5 then return false, "invalid risk or enemy clearance" end
-        end
-        return true
-    end
-    local function controllerTick(phase)
-        context.V6RoomEntry.frames = (context.V6RoomEntry.frames or 0) + 1
-        if context.RT.destroyed or not context.RT.farmEnabled then return end
-        local character = localPlayer.Character
-        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-        local root = character and character:FindFirstChild("HumanoidRootPart")
-        if not humanoid or not root or humanoid.Health <= 0 then return end
-        if character ~= lastCharacter then
-            lastCharacter, idleAt, routeDir = character, os.clock(), nil
-            sensedRoots, sensorAt = {}, -math.huge
-            failedHeadings, lastCommandDir, lastOwnedAt = {}, nil, -math.huge
-            committedDir, commitUntil = nil, 0
-            progressPos, progressAt = root.Position, os.clock()
-            rayParams = RaycastParams.new()
-            rayParams.FilterType = Enum.RaycastFilterType.Exclude
-            -- Telegraph/VFX parts are queryable but often non-collidable.
-            -- They belong to dangerAt, not the physical wall rejection test.
-            rayParams.RespectCanCollide = true
-            rayParams.FilterDescendantsInstances = {character}
-            forcedLook, savedAutoRotate = false, humanoid.AutoRotate
-        end
-        local now = os.clock()
-        local report = context.V6RoomEntry
-        report.phase = phase
-        report.nativeState = context.RT.movementState
-        report.position = {x = root.Position.X, z = root.Position.Z}
-        local function applyCommand(direction, reason)
-            -- Keep the native guards' input consistent with the final command.
-            -- Previously only Humanoid.Move changed, leaving MV.cmdDir stale.
-            local native = context.MV
-            local prior = native and native.cmdDir
-            if native then
-                native.cmdDir = direction.Magnitude > 0.01 and direction or nil
-                native.cmdAt = context.RT.brainNow or now
-                native.driving = direction.Magnitude > 0.01
-            end
-            report.trace = report.trace or {}
-            report.traceIndex = (report.traceIndex or 0) % 120 + 1
-            report.trace[report.traceIndex] = {
-                at = now, phase = phase, reason = reason,
-                x = root.Position.X, z = root.Position.Z,
-                nativeX = prior and prior.X, nativeZ = prior and prior.Z,
-                dx = direction.X, dz = direction.Z, speed = humanoid.WalkSpeed,
-                stalledFor = now - progressAt,
-            }
-            report.lastDecision = reason
-            lastOwnedAt = now
-            humanoid:Move(direction, false)
-        end
-        failedThisFrame = false
-        local moving = humanoid.MoveDirection.Magnitude > 0.08
-        if moving then idleAt = now end
-        -- A hazard-free direction is still useless when it points into a
-        -- wall. Drop a committed lane as soon as it stops producing real
-        -- displacement so the next scan can choose an open escape instead.
-        local progressDelta = progressPos and Vector3.new(root.Position.X - progressPos.X, 0,
-            root.Position.Z - progressPos.Z).Magnitude or math.huge
-        local attempted = lastCommandDir or (moving and humanoid.MoveDirection.Unit)
-        if not progressPos or progressDelta >= 1.5 then
-            progressPos, progressAt = root.Position, now
-        elseif attempted and humanoid.WalkSpeed > 0 and not root.Anchored
-            and now - progressAt >= 0.45 then
-            -- Net horizontal displacement, rather than input or small jitter,
-            -- determines progress. Include native-controller commands too.
-            failedHeadings[#failedHeadings + 1] = {
-                direction = attempted, untilAt = now + 1.2,
-            }
-            failedThisFrame = true
-            committedDir, commitUntil, routeDir = nil, 0, nil
-            progressPos, progressAt, lastScanAt = root.Position, now, -math.huge
-            context.V6RoomEntry.failedMoves = (context.V6RoomEntry.failedMoves or 0) + 1
-        elseif not attempted or humanoid.WalkSpeed <= 0 or root.Anchored then
-            progressPos, progressAt = root.Position, now
-        end
-        local pingS = context.RT and (context.RT.pingS or context.RT.dataPingS) or 0
-        local pingLead = math.clamp((tonumber(pingS) or 0) + 0.16, 0, 0.60)
-        -- A latency forecast must not erase an attack that is active now
-        -- but expires before the predicted arrival time.
-        local function strictDanger(x, y, z, lead)
-            return context.dangerAt(x, y, z, lead, nil, nil, nil, true)
-        end
-        local function routeDanger(x, y, z, lead)
-            if lead == 0 then
-                local active = strictDanger(x, y, z, 0)
-                local predicted = strictDanger(x, y, z, pingLead)
-                return math.max(active, predicted), active
-            end
-            local live = strictDanger(x, y, z, lead)
-            local predicted = strictDanger(x, y, z, lead + pingLead)
-            local activeNow = strictDanger(x, y, z, 0)
-            if type(live) ~= "number" or type(predicted) ~= "number"
-                or type(activeNow) ~= "number" then
-                return math.huge
-            end
-            return math.max(live, predicted, activeNow), activeNow
-        end
-        -- Reapply after native/spell resets, before prediction uses the speed.
-        -- Respect an actual game hold rather than walking out of a stun.
-        if context.speedNormal and humanoid.WalkSpeed > 0 then
-            humanoid.WalkSpeed = context.speedNormal()
-        end
-        -- Movement auto-rotation was winning the final frame against the
-        -- Archpriestess LOOK AWAY controller. That caused the stun visible at
-        -- 2:03 in the recording, leaving the avatar unable to clear the orb.
-        -- Apply the required facing after movement and hold it for the whole
-        -- warning without changing the avatar's position.
-        local lookPoint = nil
-        if type(context.gsLookPoint) == "function" then
-            local ok, point = pcall(context.gsLookPoint, root.Position)
-            if ok then lookPoint = point end
-        end
-        if not lookPoint and context.RT and context.RT.gsLookSince
-            and context.RT.gsLook and context.RT.gsLook.src then
-            local src = context.RT.gsLook.src
-            local dx, dz = root.Position.X - src.X, root.Position.Z - src.Z
-            if context.RT.gsLook.toward then dx, dz = -dx, -dz end
-            local length = math.sqrt(dx * dx + dz * dz)
-            if length > 0.01 then
-                lookPoint = root.Position + Vector3.new(dx / length * 20, 0, dz / length * 20)
-            end
-        end
-        if lookPoint then
-            if not forcedLook then savedAutoRotate = humanoid.AutoRotate end
-            forcedLook = true
-            humanoid.AutoRotate = false
-            local flatLook = Vector3.new(lookPoint.X, root.Position.Y, lookPoint.Z)
-            if (flatLook - root.Position).Magnitude > 0.01 then
-                root.CFrame = CFrame.lookAt(root.Position, flatLook)
-            end
-        elseif forcedLook then
-            forcedLook = false
-            humanoid.AutoRotate = savedAutoRotate
-        end
-        -- Track the large Archpriestess orb directly from scene geometry.
-        -- Its collision can arrive before the generic hazard list refreshes,
-        -- especially at the 320-340 ms ping shown in the recording.
-        local orbPos, orbVel, orbRadius, orbClearance = nil, Vector3.zero, 0, math.huge
-        local archpriestActive = false
-        if context.RD and context.RD.enemies then
-            for _, enemy in ipairs(context.RD.enemies) do
-                local modelName = enemy.model and string.lower(enemy.model.Name) or ""
-                if modelName:find("archpriest", 1, true) or modelName:find("kiryne", 1, true) then
-                    archpriestActive = true
-                    break
-                end
-            end
-        end
-        if archpriestActive and context.Workspace and context.Workspace.GetPartBoundsInRadius then
-            local ok, parts = pcall(function()
-                return context.Workspace:GetPartBoundsInRadius(root.Position, 70)
-            end)
-            if ok and parts then
-                for _, part in ipairs(parts) do
-                    if part:IsA("BasePart") and part:IsDescendantOf(context.Workspace) then
-                        local size = part.Size
-                        local minSize = math.min(size.X, size.Y, size.Z)
-                        local maxSize = math.max(size.X, size.Y, size.Z)
-                        local colour = part.Color
-                        local name = string.lower(part.Name)
-                        local orbLike = name:find("orb", 1, true)
-                            or name:find("sphere", 1, true)
-                            or name:find("projectile", 1, true)
-                        local magenta = colour.R > 0.78 and colour.B > 0.78
-                            and ((colour.R + colour.B) * 0.5 - colour.G) > 0.16
-                        -- Requiring the boss, magenta colour, and either an
-                        -- orb-like name or a very large sphere prevents the
-                        -- cyan Q/E visuals from poisoning every route.
-                        if minSize >= 4.5 and maxSize >= 7 and magenta
-                            and (orbLike or minSize >= 6) then
-                            local radius = maxSize * 0.5
-                            local distance = (root.Position - part.Position).Magnitude - radius
-                            if distance < orbClearance then
-                                orbPos, orbVel, orbRadius, orbClearance =
-                                    part.Position, part.AssemblyLinearVelocity, radius, distance
-                            end
-                        end
-                    end
-                end
-            end
-        end
-        local orbTooClose = orbPos ~= nil and orbClearance < 34
-        -- The built-in Gilded Skies controller already ranks the green
-        -- refuge circles and knows their activation time. Give that one
-        -- mechanic exclusive movement ownership just before the field goes
-        -- lethal; the generic enemy keep-out must not pull the avatar off the
-        -- selected refuge because it happens to be near the boss.
-        local safeField = context.RD and context.RD.safeField
-        local safeSpots = safeField and safeField.gsSpots
-        local safeFieldActive = safeField
-            and (archpriestActive or safeField.name == "archpriestsafezones")
-            and type(safeSpots) == "table"
-            and #safeSpots > 0
-            and now >= (safeField.from or now) - 2.5
-            and now <= (safeField.untilAt or now) + 0.35
-        if safeFieldActive then
-            context.V6RoomEntry.waiting = false
-            committedDir, commitUntil, routeDir, lastCommandDir = nil, 0, nil, nil
-            report.lastDecision = "yield: green refuge owner"
-            if context.archRefugeTick then
-                local ok, handled = pcall(context.archRefugeTick, humanoid, root, now)
-                if ok and handled then report.lastDecision = "green refuge: priority movement"
-                elseif not ok then report.lastError = tostring(handled) end
-            end
-            idleAt = now
-            return
-        end
-        local rowPattern = archpriestActive and context.gsB1Lanes and context.gsB1Lanes(now)
-        if rowPattern and context.archRowGapTick then
-            local ok, handled = pcall(context.archRowGapTick, humanoid, root, now)
-            if ok and handled then
-                committedDir, commitUntil, routeDir, lastCommandDir = nil, 0, nil, nil
-                progressPos, progressAt = root.Position, now
-                report.lastDecision = "first boss: row opening owns movement"
-                return
-            elseif not ok then report.lastError = tostring(handled) end
-        end
-        -- The dungeon controller has detailed geometry for named attacks.
-        -- Keep its route unless a live enemy has already breached the inner
-        -- envelope. The 17:47 recording showed the named escape arriving while
-        -- the avatar was still in point-blank range of the red lane attack;
-        -- in that case the frame-level emergency layer must preempt it.
-        local movementState = context.RT and context.RT.movementState
-        local specializedEscape = type(movementState) == "string"
-            and (
-                movementState:sub(1, 7) == "ESCAPE "
-                or movementState:sub(1, 8) == "KCIRCLE:"
-                or movementState:sub(1, 6) == "SNAKE:"
-                or movementState:sub(1, 10) == "SAFE SPOT:"
-            )
-        -- Do not wait for the first telegraph after the combat mover has
-        -- already entered the pack. Track a wider planning envelope plus a
-        -- smaller preemption envelope that can take movement ownership from a
-        -- named escape only when the avatar is already in immediate danger.
-        -- Sense before any safe-heading / specialized-route early return.
-        -- Merge all live nearby enemies, rather than replacing a checked
-        -- group escape with a retreat from just the nearest model at the end.
-        if now - sensorAt >= 0.05 then
-            sensorAt, sensedRoots = now, {}
-            local world = context.Workspace or workspace
-            local ok, parts = pcall(function()
-                return world:GetPartBoundsInRadius(root.Position, 50)
-            end)
-            if ok and parts then
-                local seen = {}
-                for _, part in ipairs(parts) do
-                    local model = part:FindFirstAncestorOfClass("Model")
-                    while model and model ~= character do
-                        local h = model:FindFirstChildOfClass("Humanoid")
-                        local r = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
-                        if h and r then
-                            if not seen[model] and h.Health > 0
-                                and not players:GetPlayerFromCharacter(model) then
-                                seen[model] = true
-                                sensedRoots[#sensedRoots + 1] = {root = r, humanoid = h}
-                            end
-                            break
-                        end
-                        model = model:FindFirstAncestorOfClass("Model")
-                    end
-                end
-            end
-        end
-        local nearbyEnemies, seenRoots = {}, {}
-        for _, enemy in ipairs(context.RD and context.RD.enemies or {}) do
-            local r = enemy.root
-            local h = enemy.model and enemy.model:FindFirstChildOfClass("Humanoid")
-            if (not h or h.Health > 0) and (not r or r.Parent) then
-                nearbyEnemies[#nearbyEnemies + 1] = enemy
-                if r then seenRoots[r] = true end
-            end
-        end
-        for _, enemy in ipairs(sensedRoots) do
-            if enemy.root.Parent and enemy.humanoid.Health > 0 and not seenRoots[enemy.root] then
-                seenRoots[enemy.root] = true
-                nearbyEnemies[#nearbyEnemies + 1] = enemy
-            end
-        end
-        local enemyTooClose, enemyEmergency = false, false
-        if #nearbyEnemies > 0 then
-            for _, enemy in ipairs(nearbyEnemies) do
-                local ex, ez = enemy.x, enemy.z
-                if enemy.root and enemy.root.Parent then
-                    ex, ez = enemy.root.Position.X, enemy.root.Position.Z
-                end
-                if type(ex) == "number" and type(ez) == "number" then
-                    local dx, dz = root.Position.X - ex, root.Position.Z - ez
-                    local velocity = enemy.root and enemy.root.AssemblyLinearVelocity
-                    local vx = velocity and velocity.X or tonumber(enemy.vx) or 0
-                    local vz = velocity and velocity.Z or tonumber(enemy.vz) or 0
-                    local approachLead = pingLead + 0.60
-                    local predictedDx, predictedDz = dx - vx * approachLead, dz - vz * approachLead
-                    local distance2 = math.min(dx * dx + dz * dz,
-                        predictedDx * predictedDx + predictedDz * predictedDz)
-                    if distance2 < 38 * 38 then enemyTooClose = true end
-                    if distance2 < 30 * 30 then enemyEmergency = true end
-                end
-            end
-        end
-        -- The built-in hardcore profile starts moving at 0.12 danger. The old
-        -- watchdog waited for 0.35, which explains the visible late first step
-        -- on close red lanes. Match that sensitivity at point-blank range while
-        -- retaining a little hysteresis farther away.
-        local riskLimit = enemyEmergency and 0.12 or (enemyTooClose and 0.16 or 0.24)
-        -- A wide lane may take more than half a second to leave at speed 22.
-        -- Use one horizon for validation, escape scoring and retreat checks.
-        local routeSamples = {0.03}
-        -- At speed 27 the old gaps could skip a narrow active strip.
-        -- Sample every 0.05 seconds (at most 1.35 studs between probes).
-        for index = 1, 25 do routeSamples[#routeSamples + 1] = index * 0.05 end
-        local function enemyDistance(point, lead)
-            local closest = math.huge
-            for _, enemy in ipairs(nearbyEnemies) do
-                local ex, ez = enemy.x, enemy.z
-                if enemy.root and enemy.root.Parent then
-                    ex, ez = enemy.root.Position.X, enemy.root.Position.Z
-                end
-                if type(ex) == "number" and type(ez) == "number" then
-                    if lead and lead > 0 then
-                        local velocity = enemy.root and enemy.root.AssemblyLinearVelocity
-                        local vx = velocity and velocity.X or tonumber(enemy.vx) or 0
-                        local vz = velocity and velocity.Z or tonumber(enemy.vz) or 0
-                        ex, ez = ex + vx * lead, ez + vz * lead
-                    end
-                    local dx, dz = point.X - ex, point.Z - ez
-                    closest = math.min(closest, math.sqrt(dx * dx + dz * dz))
-                end
-            end
-            return closest
-        end
-        local function laneOpen(candidate, requireHazardSafe, shortReach)
-            if not candidate or candidate.Magnitude <= 0.01 then return false end
-            candidate = candidate.Unit
-            local origin = root.Position + Vector3.new(0, 1.5, 0)
-            local side = Vector3.new(-candidate.Z, 0, candidate.X)
-            local reach = shortReach or math.max(8, math.min(13, humanoid.WalkSpeed * 0.60))
-            -- A centre ray can clear a corner while the avatar's shoulder
-            -- still collides with it. Require a body-width corridor.
-            for _, offset in ipairs({0, -1.5, 1.5}) do
-                local castOk, hit = pcall(function()
-                    return (context.Workspace or workspace):Raycast(
-                        origin + side * offset, candidate * reach, rayParams)
-                end)
-                if not castOk or hit then return false end
-            end
-            if requireHazardSafe and context.dangerAt then
-                local maxLead = shortReach and shortReach / math.max(humanoid.WalkSpeed, 12) or math.huge
-                for _, travelLead in ipairs(routeSamples) do
-                    if travelLead > maxLead then break end
-                    local point = root.Position
-                        + candidate * math.max(humanoid.WalkSpeed, 12) * travelLead
-                    local ok, risk = pcall(
-                        routeDanger,
-                        point.X,
-                        point.Y,
-                        point.Z,
-                        travelLead
-                    )
-                    if not ok or type(risk) ~= "number" or risk >= riskLimit then
-                        return false
-                    end
-                end
-                if shortReach then
-                    local point = root.Position + candidate * shortReach
-                    local ok, risk = pcall(routeDanger, point.X, point.Y, point.Z, maxLead)
-                    if not ok or type(risk) ~= "number" or risk >= riskLimit then return false end
-                end
-            end
-            return true
-        end
-        local function wallRoom(point)
-            local closest = 12
-            for i = 0, 7 do
-                local angle = i * math.pi / 4
-                local hit = (context.Workspace or workspace):Raycast(point + Vector3.new(0, 1.5, 0),
-                    Vector3.new(math.cos(angle), 0, math.sin(angle)) * 12, rayParams)
-                if hit then closest = math.min(closest, hit.Distance) end
-            end
-            return closest
-        end
-        local function projectileImpact(direction, horizon)
-            if not context.projectileImpact then return math.huge, math.huge, math.huge end
-            return context.projectileImpact(root.Position, direction, math.max(humanoid.WalkSpeed, 12), horizon or 1.25)
-        end
-        local stalled = failedThisFrame or now - progressAt >= 0.45
-        local wasWaiting = context.V6RoomEntry.waiting == true
-        -- Do not compete with the game's normal movement controller while it
-        -- is already carrying us through a safe lane. The watchdog only takes
-        -- ownership when the next short step is genuinely dangerous.
-        -- A validated dodge owns this brief interval before native movement
-        -- can take over. Validate the step we will execute, rather than
-        -- discarding it because of a hazard 30 studs down an unexecuted ray.
-        if committedDir and now < commitUntil and not stalled and context.dangerAt then
-            local span = math.min(0.18, math.max(0.06, commitUntil - now))
-            local speed = math.max(humanoid.WalkSpeed, 12)
-            local open = laneOpen(committedDir, false, math.max(2.2, speed * span))
-                and not failedHeading(committedDir, now)
-            local function stepRisk(t)
-                local point = root.Position + committedDir * speed * t
-                -- The long-range planner already includes ping margin.
-                -- Retention checks collision at this step's arrival time,
-                -- rather than cancelling for a later, unexecuted forecast.
-                return strictDanger(point.X, point.Y, point.Z, t)
-            end
-            local function stepClearance(t)
-                return enemyDistance(root.Position + committedDir * speed * t, t + pingLead)
-            end
-            local keep, reason = retainDodgeStep(span, open, projectileImpact(committedDir, span),
-                stepRisk, stepClearance, riskLimit)
-            if keep then
-                routeDir, lastCommandDir = committedDir, committedDir
-                applyCommand(routeDir, "move: retained checked dodge step")
-                return
-            end
-            report.commitCancelled = reason
-            report.commitCancels = (report.commitCancels or 0) + 1
-            committedDir, commitUntil, routeDir = nil, 0, nil
-            lastScanAt = -math.huge
-        end
-        if moving and context.dangerAt then
-            local heading = humanoid.MoveDirection.Unit
-            local travelLead = 0.12
-            local hazardLead = travelLead + pingLead
-            local probe = root.Position + heading * math.max(humanoid.WalkSpeed, 12) * travelLead
-            local currentOk, currentRisk = pcall(
-                routeDanger,
-                root.Position.X,
-                root.Position.Y,
-                root.Position.Z,
-                0
-            )
-            local quickOk, quickRisk = pcall(
-                routeDanger,
-                probe.X,
-                probe.Y,
-                probe.Z,
-                travelLead
-            )
-            local currentSafe = currentOk and type(currentRisk) == "number" and currentRisk < riskLimit
-            local forwardSafe = quickOk and type(quickRisk) == "number" and quickRisk < riskLimit
-            local currentClearance = enemyDistance(root.Position)
-            local forwardClearance = enemyDistance(probe, hazardLead)
-            -- Outside the planning buffer, allow normal approach again.
-            -- Inside it, allow a checked tangent/away route, but never hand
-            -- back a command that enters the immediate enemy envelope.
-            local enemyLaneSafe = not enemyTooClose
-                or (not enemyEmergency and currentClearance >= 30
-                    and forwardClearance >= math.min(38, currentClearance) - 0.5)
-            if currentSafe and forwardSafe and enemyLaneSafe and not orbTooClose
-                and not stalled and not wasWaiting and not failedHeading(heading, now)
-                and laneOpen(heading, true, math.max(6, humanoid.WalkSpeed * 0.3))
-                and projectileImpact(heading, 0.3) == math.huge then
-                -- Once danger has cleared, approaching the next target is
-                -- legitimate progress, even when it reverses the old dodge.
-                committedDir, commitUntil, routeDir = nil, 0, nil
-                lastCommandDir, lastOwnedAt, lastScanAt = nil, -math.huge, -math.huge
-                report.lastDecision = "yield: safe native route; retreat complete"
-                return
-            end
-        end
-        if specializedEscape and not enemyEmergency and not stalled and not wasWaiting
-            and moving and not failedHeading(humanoid.MoveDirection, now)
-            and (not lastCommandDir or now - lastOwnedAt > 0.75
-                or humanoid.MoveDirection.Unit:Dot(lastCommandDir) >= 0)
-            and laneOpen(humanoid.MoveDirection, true)
-            and projectileImpact(humanoid.MoveDirection) == math.huge then
-            committedDir, commitUntil, routeDir = nil, 0, nil
-            idleAt = now
-            return
-        end
-        -- Route selection is expensive; movement itself stays continuous by
-        -- replaying the last safe heading between scans. Refresh at roughly
-        -- one frame while using a compact prediction horizon so the dodge
-        -- reacts quickly without blocking the render step.
-        if now - lastScanAt < 0.010 and not stalled and not wasWaiting then
-            if routeDir and routeDir.Magnitude > 0.01 then
-                lastCommandDir = routeDir
-                applyCommand(routeDir, "move: final escape")
-            end
-            return
-        end
-        lastScanAt = now
-        local dir
-        local activeFloorTrapped = false
-        local shortWallStep = false
-        local selectedExit = 0
-        local brain = context.BR
-        local goal = brain and (brain.goTo or brain.target and brain.target.root and brain.target.root.Position)
-        if goal then
-            local delta = Vector3.new(goal.X - root.Position.X, 0, goal.Z - root.Position.Z)
-            if delta.Magnitude > 5 then dir = delta.Unit end
-        end
-        if not dir then
-            local look = root.CFrame.LookVector
-            dir = Vector3.new(look.X, 0, look.Z)
-            if dir.Magnitude > 0.01 then dir = dir.Unit end
-        end
-        -- Predictive pre-dodge: sample the route before the visual telegraph
-        -- fully resolves. dangerAt includes the hazard reader's forecast,
-        -- latency margin, avatar radius, and moving projectile geometry.
-        if context.dangerAt and dir and dir.Magnitude > 0.01 then
-            local basis = dir.Unit
-            local best, bestScore = basis, math.huge
-            local fallback, fallbackScore, fallbackExit = nil, math.huge, math.huge
-            local activeOk, activeStart = pcall(strictDanger,
-                root.Position.X, root.Position.Y, root.Position.Z, 0)
-            local startsClear = activeOk and type(activeStart) == "number" and activeStart < riskLimit
-            local activeBlocked, physicalChoices = 0, 0
-            for index = 0, 15 do
-                local angle = index * math.pi / 8
-                local c, s = math.cos(angle), math.sin(angle)
-                local candidate = Vector3.new(
-                    basis.X * c - basis.Z * s, 0,
-                    basis.X * s + basis.Z * c
-                )
-                local score = failedHeading(candidate, now) and 25000 or 0
-                -- Safety exclusions still dominate. Among viable lanes,
-                -- avoid shuttling back toward the spot just escaped.
-                if lastCommandDir and now - lastOwnedAt <= 0.75 then
-                    local turn = 1 - math.clamp(candidate:Dot(lastCommandDir), -1, 1)
-                    score = score + turn * turn * 15
-                end
-                local hardUnsafe = false
-                local lastUnsafe = 0
-                local hitAt, exitAt = projectileImpact(candidate)
-                if hitAt < math.huge then
-                    hardUnsafe = true
-                    lastUnsafe = math.min(1.25, exitAt)
-                    -- Earlier incoming impacts dominate ordinary route scores.
-                    score = score + 10000 / (0.05 + hitAt)
-                end
-                local activeCleared, crossesActive = startsClear, false
-                local physicalOpen = laneOpen(candidate, false)
-                if physicalOpen then
-                    physicalChoices = physicalChoices + 1
-                    -- Reserve turning space before the pack pins us against
-                    -- a wall. Only ranks physically open candidates; hazard
-                    -- and projectile exclusions still determine eligibility.
-                    local room = wallRoom(root.Position + candidate * 8)
-                    score = score + math.max(0, 10 - room) ^ 2 * 3
-                end
-                -- Reject escape headings that cannot physically carry the
-                -- avatar clear. This is the wall-trap shown in the 17:14
-                -- recording: dangerAt saw empty space beyond the wall and the
-                -- old watchdog repeatedly committed to an impossible route.
-                if not physicalOpen then
-                    score = score + 1000
-                    hardUnsafe = true
-                end
-                for _, travelLead in ipairs(routeSamples) do
-                    if not physicalOpen then break end
-                    local hazardLead = travelLead + pingLead
-                    local point = root.Position
-                        + candidate * math.max(humanoid.WalkSpeed, 12) * travelLead
-                    local ok, risk, activeRisk = pcall(
-                        routeDanger,
-                        point.X,
-                        point.Y,
-                        point.Z,
-                        travelLead
-                    )
-                    if type(activeRisk) == "number" then
-                        if activeRisk < riskLimit then
-                            activeCleared = true
-                        elseif activeCleared then
-                            crossesActive = true
-                        end
-                    end
-                    if not ok or type(risk) ~= "number" then
-                        score = math.huge
-                        break
-                    end
-                    score = score + math.max(0, risk) * (1.2 - hazardLead * 0.5)
-                    if orbPos then
-                        local futureOrb = orbPos + orbVel * hazardLead
-                        local clearance = (point - futureOrb).Magnitude - orbRadius
-                        if clearance < 12 then
-                            hardUnsafe = true
-                            lastUnsafe = travelLead
-                            score = score + 2000 + (12 - clearance) * 100
-                        elseif clearance < 34 then
-                            score = score + (34 - clearance) * (34 - clearance) * 3
-                        end
-                    end
-                    -- A live floor telegraph is a hard exclusion. Keep a
-                    -- least-risk fallback for the rare case where every
-                    -- heading is blocked, but never prefer a blocked lane
-                    -- over any heading that clears the active attack.
-                    if risk >= riskLimit then
-                        hardUnsafe = true
-                        lastUnsafe = travelLead
-                    end
-                    if #nearbyEnemies > 0 then
-                        for _, enemy in ipairs(nearbyEnemies) do
-                            local ex, ez = enemy.x, enemy.z
-                            if enemy.root and enemy.root.Parent then
-                                ex, ez = enemy.root.Position.X, enemy.root.Position.Z
-                            end
-                            if type(ex) == "number" and type(ez) == "number" then
-                                local velocity = enemy.root and enemy.root.AssemblyLinearVelocity
-                                local vx = velocity and velocity.X or tonumber(enemy.vx) or 0
-                                local vz = velocity and velocity.Z or tonumber(enemy.vz) or 0
-                                ex, ez = ex + vx * hazardLead, ez + vz * hazardLead
-                                local dx, dz = point.X - ex, point.Z - ez
-                                local distance = math.sqrt(dx * dx + dz * dz)
-                                -- Reject lanes intercepted by the incoming pack.
-                                -- If already cornered, retain the earliest-exit
-                                -- fallback rather than disabling movement.
-                                if distance < math.min(30, enemyDistance(root.Position)) - 1 then
-                                    hardUnsafe = true
-                                    lastUnsafe = travelLead
-                                end
-                                -- Keep a wide buffer around every live enemy;
-                                -- a route that clears a hazard but enters melee
-                                -- range is not a safe route.
-                                if distance < 36 then
-                                    score = score + (36 - distance) * (36 - distance) * 1.2
-                                end
-                            end
-                        end
-                    end
-                end
-                -- Prefer the shortest angular correction when routes are
-                -- comparably safe. Risk remains the dominant term, so this
-                -- cannot trade a materially safer heading for convenience.
-                local alignment = math.clamp(candidate:Dot(basis), -1, 1)
-                score = score + (1 - alignment) * 0.35
-                -- If already inside an attack, every heading shares an unsafe
-                -- prefix. Prefer the open lane that clears it earliest; never
-                -- select a wall merely because all hazard scores are large.
-                if physicalOpen and crossesActive then activeBlocked = activeBlocked + 1 end
-                if physicalOpen and hitAt == math.huge and not crossesActive and score < math.huge and (
-                    lastUnsafe < fallbackExit
-                    or lastUnsafe == fallbackExit and score < fallbackScore
-                ) then
-                    fallback, fallbackScore, fallbackExit = candidate, score, lastUnsafe
-                end
-                if not hardUnsafe and score < bestScore then best, bestScore = candidate, score end
-            end
-            if bestScore == math.huge then
-                -- A 13-stud straight corridor is not required to take one
-                -- safe step around a nearby corner. Try short body-width
-                -- corridors before declaring that all movement is blocked.
-                for index = 0, 15 do
-                    local angle = index * math.pi / 8
-                    local c, sn = math.cos(angle), math.sin(angle)
-                    local candidate = Vector3.new(basis.X * c - basis.Z * sn, 0,
-                        basis.X * sn + basis.Z * c)
-                    if laneOpen(candidate, true, 3.5)
-                        and projectileImpact(candidate, 3.5 / math.max(humanoid.WalkSpeed, 12)) == math.huge then
-                        local point = root.Position + candidate * 3.5
-                        local currentDistance = enemyDistance(root.Position)
-                        local futureDistance = enemyDistance(point, 3.5 / math.max(humanoid.WalkSpeed, 12) + pingLead)
-                        if futureDistance >= math.min(8, currentDistance) - 0.5 then
-                            -- A wall slide may briefly reduce the broad melee
-                            -- buffer. Keep a hard body clearance and rank by
-                            -- separation instead of vetoing every tangent.
-                            local score = (1 - candidate:Dot(basis)) * 0.35
-                                + math.max(0, 30 - futureDistance) ^ 2 * 1.2
-                                + math.max(0, 10 - wallRoom(point)) ^ 2 * 3
-                                + (failedHeading(candidate, now) and 25000 or 0)
-                            if lastCommandDir then
-                                local turn = 1 - math.clamp(candidate:Dot(lastCommandDir), -1, 1)
-                                score = score + turn * turn * 15
-                            end
-                            if score < bestScore then
-                                best, bestScore, shortWallStep = candidate, score, true
-                            end
-                        end
-                    end
-                end
-            end
-            if bestScore == math.huge then
-                -- Waiting is valid only if the whole stationary interval
-                -- remains clear of both attacks and approaching enemies.
-                local canWait = (not archpriestActive or rowPattern) and not orbTooClose and not enemyTooClose
-                    and enemyDistance(root.Position) >= 38
-                for index = 0, math.ceil((1.25 + pingLead) / 0.05) do
-                    if not canWait then break end
-                    local lead = index * 0.05
-                    local ok, risk = pcall(strictDanger,
-                        root.Position.X, root.Position.Y, root.Position.Z, lead)
-                    canWait = ok and type(risk) == "number" and risk < riskLimit
-                        and enemyDistance(root.Position, lead) >= 38
-                end
-                if canWait then
-                    committedDir, commitUntil, routeDir = nil, 0, nil
-                    context.V6RoomEntry.waiting = true
-                    lastCommandDir = nil
-                    context.V6RoomEntry.lastDecision = "wait: stationary interval checked"
-                    applyCommand(Vector3.zero, "wait: checked stationary interval")
-                    return -- no cooldown: re-score every frame until a route opens
-                end
-                best = fallback
-                if fallback then selectedExit = fallbackExit end
-                activeFloorTrapped = not fallback and startsClear and activeBlocked > 0
-                context.V6RoomEntry.fallbackExit = fallbackExit
-            end
-            -- Established lanes were fully revalidated above. Do not replace
-            -- this newly checked selection using only one endpoint sample.
-            dir = best
-        end
-        -- Hard melee keep-out: once an enemy breaches the inner envelope,
-        -- retreat first. Continuing to approach while the attack animation is
-        -- already in range is the failure pattern seen in the recordings.
-        if #nearbyEnemies > 0 then
-            local awayX, awayZ, urgent = 0, 0, false
-            for _, enemy in ipairs(nearbyEnemies) do
-                local ex, ez = enemy.x, enemy.z
-                if enemy.root and enemy.root.Parent then
-                    ex, ez = enemy.root.Position.X, enemy.root.Position.Z
-                end
-                if type(ex) == "number" and type(ez) == "number" then
-                    local dx, dz = root.Position.X - ex, root.Position.Z - ez
-                    local distance = math.sqrt(dx * dx + dz * dz)
-                    if distance < 38 then
-                        local weight = math.max(1, 38 - distance)
-                        awayX, awayZ = awayX + dx / math.max(distance, 0.1) * weight,
-                            awayZ + dz / math.max(distance, 0.1) * weight
-                        urgent = true
-                    end
-                end
-            end
-            if urgent and math.abs(awayX) + math.abs(awayZ) > 0.01 then
-                local retreat = Vector3.new(awayX, 0, awayZ).Unit
-                -- Never replace a fully checked dodge with a retreat that
-                -- crosses a live floor attack or runs into room geometry.
-                if not dir and not failedHeading(retreat, now) and laneOpen(retreat, true)
-                    and projectileImpact(retreat) == math.huge then dir = retreat end
-            end
-        end
-        if not dir and archpriestActive and not rowPattern and context.archMovingFallback then
-            dir = context.archMovingFallback(humanoid, root, lastCommandDir, goal)
-            shortWallStep = dir ~= nil
-            activeFloorTrapped = false
-        end
-        if not dir then
-            committedDir, commitUntil, routeDir = nil, 0, nil
-            if activeFloorTrapped then
-                context.V6RoomEntry.waiting = true
-                lastCommandDir = nil
-                applyCommand(Vector3.zero, "wait: active floor blocks all exits")
-            elseif humanoid.MoveDirection.Magnitude > 0.01
-                and projectileImpact(humanoid.MoveDirection, 0.3) < math.huge then
-                context.V6RoomEntry.waiting = true
-                lastCommandDir = nil
-                applyCommand(Vector3.zero, "wait: imminent projectile blocks native step")
-            end
-            return -- recheck waiting each frame; physical wall recovery otherwise stays native
-        end
-        if dir.Magnitude > 0.01 then
-            context.V6RoomEntry.waiting = false
-            routeDir = dir.Unit
-            committedDir = routeDir
-            commitUntil = now + (shortWallStep and 0.12 or math.clamp(selectedExit + 0.15, 0.65, 1.25))
-            if shortWallStep then
-                report.wallSteps = (report.wallSteps or 0) + 1
-            end
-            lastCommandDir = routeDir
-            context.V6RoomEntry.lastDecision = "move: selected escape heading"
-            applyCommand(routeDir, "move: final escape")
-            idleAt = os.clock()
-            context.V6RoomEntry.kicks = context.V6RoomEntry.kicks + 1
-            context.V6RoomEntry.last = {at = os.clock(), x = routeDir.X, z = routeDir.Z}
-        end
-    end
-    context.v6FinalizeMovement = function(phase)
-        local started = os.clock()
-        local ok, err = pcall(controllerTick, phase)
-        local report = context.V6RoomEntry
-        report.lastWorkMs = (os.clock() - started) * 1000
-        report.maxWorkMs = math.max(report.maxWorkMs or 0, report.lastWorkMs)
-        if not ok then
-            local report = context.V6RoomEntry
-            report.errors = (report.errors or 0) + 1
-            report.lastError = tostring(err)
-            if os.clock() - (report.lastWarnAt or -math.huge) > 2 then
-                report.lastWarnAt = os.clock()
-                warn("[HL V6 controller] " .. report.lastError)
-            end
-        end
-    end
-    context.V6RoomEntry.connection = motionSignal:Connect(function()
-        context.v6FinalizeMovement("pre-physics")
-    end)
+    local Planner=(function()
+-- Pure Lua: deterministic time-aware route planner; no Roblox or executor APIs.
+local Planner = {}
+Planner.__index = Planner
+local huge, sqrt = math.huge, math.sqrt
+local function dist(a, b) return sqrt((a.x-b.x)^2 + (a.z-b.z)^2) end
+local function unit(a, b)
+    local n = dist(a,b)
+    if n < 0.001 then return 0,0 end
+    return (b.x-a.x)/n, (b.z-a.z)/n
 end
-return context
+function Planner.new()
+    return setmetatable({events={}, serial=0, blocked={}, nextPlan=0, lastLog=-huge}, Planner)
+end
+function Planner:log(e, reason, extra)
+    local event={at=e.now, reason=reason, x=e.x, z=e.z, mode=e.mode, route=self.route and self.route.id}
+    for k,v in pairs(extra or {}) do event[k]=v end
+    self.events[#self.events+1]=event
+    if #self.events>160 then table.remove(self.events,1) end
+end
+function Planner:reset()
+    self.route, self.progress, self.lastMove, self.invalidSince = nil,nil,nil,nil
+    self.nextPlan, self.blocked = 0,{}
+end
+function Planner:bound(e,p)
+    return not e.circle or dist(p,e.circle)<=e.circle.r
+end
+-- Evaluate travel AND a dwell at the endpoint, at their actual future times.
+-- Only the initial occupied hazard may be escaped; never re-enter active fire.
+function Planner:evaluate(e, points, dwell)
+    local origin={x=e.x,z=e.z}
+    local elapsed, exposure, peak, cleared=0,0,0,false
+    local initial=e.risk(origin.x,origin.z,0)
+    if type(initial)~='number' or initial~=initial then return nil,'invalid geometry',0 end
+    cleared=initial<0.12
+    local initialEnemy=e.enemy and e.enemy(origin.x,origin.z,0) or huge
+    local lastRisk=initial
+    for _,target in ipairs(points) do
+        if not self:bound(e,target) then return nil,'refuge boundary',elapsed end
+        local length=dist(origin,target)
+        local duration=length/e.speed
+        if length>0.05 then
+            if e.wall(origin.x,origin.z,target.x,target.z) then return nil,'wall',elapsed end
+            local hit=e.projectile(origin.x,origin.z,target.x,target.z,elapsed,duration)
+            if hit then return nil,'projectile',elapsed+(type(hit)=='number' and hit or 0) end
+        end
+        local steps=math.max(1,math.ceil(duration/0.05))
+        for i=1,steps do
+            local f=i/steps
+            local x,z=origin.x+(target.x-origin.x)*f,origin.z+(target.z-origin.z)*f
+            local at=elapsed+duration*f
+            local risk=e.risk(x,z,at)
+            if type(risk)~='number' or risk~=risk or risk==huge then return nil,'invalid geometry',at end
+            if risk<0.12 then cleared=true
+            elseif cleared or risk>initial+0.01 then return nil,'attack',at end
+            local enemy=e.enemy and e.enemy(x,z,at) or huge
+            if enemy<math.min(7,initialEnemy)-0.5 then return nil,'enemy body',at end
+            exposure=exposure+math.max(risk,0)*0.05
+            peak=math.max(peak,risk)
+            lastRisk=risk
+        end
+        elapsed=elapsed+duration
+        origin=target
+    end
+    if dwell>0 then
+        local hit=e.projectile(origin.x,origin.z,origin.x,origin.z,elapsed,dwell)
+        if hit then return nil,'projectile at destination',elapsed+(type(hit)=='number' and hit or 0) end
+        for i=0,math.ceil(dwell/0.05) do
+            local at=elapsed+math.min(dwell,i*0.05)
+            if e.risk(origin.x,origin.z,at)>=0.12 then return nil,'destination closes',at end
+            if e.enemy and e.enemy(origin.x,origin.z,at)<math.min(9,initialEnemy)-0.5 then
+                return nil,'enemy intercepts destination',at
+            end
+        end
+        cleared=true
+    end
+    if not cleared and dwell>0 then return nil,'no clear exit',elapsed end
+    return {time=elapsed,exposure=exposure,peak=peak,lastRisk=lastRisk}
+end
+function Planner:command(e,reason)
+    local route=self.route
+    while route and #route.points>0 do
+        local target=route.points[1]
+        local reached=dist(e,target)<=0.7
+        local previous=route.previous
+        if not reached and previous then
+            -- Crossing a waypoint between physics samples counts as arrival;
+            -- do not reverse just because neither sample landed on it.
+            local dx,dz=e.x-previous.x,e.z-previous.z
+            local length2=dx*dx+dz*dz
+            if length2>0.0001 then
+                local t=((target.x-previous.x)*dx+(target.z-previous.z)*dz)/length2
+                if t>=0 and t<=1 then
+                    reached=dist(target,{x=previous.x+dx*t,z=previous.z+dz*t})<=0.9
+                end
+            end
+        end
+        if not reached then break end
+        table.remove(route.points,1)
+        self.progress=nil
+    end
+    if route then route.previous={x=e.x,z=e.z} end
+    if not route or #route.points==0 then return nil end
+    local dx,dz=unit(e,route.points[1])
+    self.lastMove={x=dx,z=dz}
+    return {kind='move',dx=dx,dz=dz,route=route.id,target=route.points[1],reason=reason,
+        holdAttack=e.mode~='refuge' or e.risk(e.x,e.z,0)>=0.12 or (e.enemy and e.enemy(e.x,e.z,0)<12)}
+end
+function Planner:cancel(e,reason)
+    local route=self.route
+    if route and route.points[1] then
+        self.blocked[#self.blocked+1]={x=route.points[1].x,z=route.points[1].z,untilAt=e.now+0.9}
+    end
+    self:log(e,'cancel: '..reason)
+    self.route,self.progress,self.invalidSince=nil,nil,nil
+    self.nextPlan=0
+end
+function Planner:choose(e)
+    local selected,score
+    local reject={}
+    local function consider(points)
+        local result,why=self:evaluate(e,points,0.3)
+        if not result then reject[why]=(reject[why] or 0)+1 return end
+        local target=points[#points]
+        for _,bad in ipairs(self.blocked) do
+            if e.now<bad.untilAt and dist(target,bad)<2 then return end
+        end
+        local cost=result.time*8+result.exposure*300
+        if self.lastMove then
+            local dx,dz=unit(e,points[1])
+            cost=cost+(1-(dx*self.lastMove.x+dz*self.lastMove.z))*5
+        end
+        if e.goal then cost=cost+dist(target,e.goal)*0.15 end
+        if e.enemy then cost=cost+math.max(0,26-e.enemy(target.x,target.z,result.time))^2*0.25 end
+        if e.room then cost=cost+math.max(0,8-e.room(target.x,target.z))^2 end
+        if e.mode=='refuge' and e.circle then
+            local ax,az=e.x-e.circle.x,e.z-e.circle.z
+            local bx,bz=target.x-e.circle.x,target.z-e.circle.z
+            if ax*bz-az*bx<0 then cost=cost+8 end
+            cost=cost+math.abs(dist(target,e.circle)-e.circle.r*0.72)
+        end
+        if not score or cost<score then selected,score=points,cost end
+    end
+    if e.mode=='refuge' and e.circle then
+        local angle=math.atan2 and math.atan2(e.z-e.circle.z,e.x-e.circle.x)
+            or math.atan(e.z-e.circle.z,e.x-e.circle.x)
+        for _,advance in ipairs({0.5,0.9,1.4}) do
+            local r=e.circle.r*0.72
+            consider({{x=e.circle.x+math.cos(angle+advance)*r,z=e.circle.z+math.sin(angle+advance)*r}})
+        end
+        if selected then self.lastRejects=reject return selected,score end
+    end
+    -- Retain an entry/navigation destination as an explicit option.
+    if e.goal and dist(e,e.goal)<=28 then consider({e.goal}) end
+    local destinations={}
+    for _,radius in ipairs({4,8,14,22}) do
+        for i=0,15 do
+            local angle=i*math.pi/8
+            local p={x=e.x+math.cos(angle)*radius,z=e.z+math.sin(angle)*radius}
+            destinations[#destinations+1]=p
+            consider({p})
+        end
+        -- A short reachable gap is preferable to a distant route; avoid
+        -- expanding the search after a checked destination is available.
+        if selected then break end
+    end
+    -- One bend is enough for a local corner exit; native navigation still
+    -- owns travel between rooms. Check the entire timed two-segment route.
+    if not selected then
+        for i=0,7 do
+            local angle=i*math.pi/4
+            local via={x=e.x+math.cos(angle)*4,z=e.z+math.sin(angle)*4}
+            if self:bound(e,via) and not e.wall(e.x,e.z,via.x,via.z) then
+                for j=0,7 do
+                    local angle2=j*math.pi/4
+                    consider({via,{x=via.x+math.cos(angle2)*7,z=via.z+math.sin(angle2)*7}})
+                end
+            end
+        end
+    end
+    self.lastRejects=reject
+    return selected,score
+end
+function Planner:step(e)
+    if e.modeKey~=self.modeKey then
+        if self.route then self:cancel(e,'mechanic changed') end
+        self.modeKey=e.modeKey
+        self.nextPlan=0
+    end
+    for i=#self.blocked,1,-1 do if e.now>=self.blocked[i].untilAt then table.remove(self.blocked,i) end end
+    if self.route then
+        local command=self:command(e,'committed path')
+        if not command then
+            self:log(e,'arrived')
+            self.route,self.progress,self.invalidSince=nil,nil,nil
+            self.nextPlan=0
+        else
+            if not self.progress then self.progress={x=e.x,z=e.z,at=e.now} end
+            local advanced=dist(e,self.progress)
+            if advanced>=1.2 then self.progress={x=e.x,z=e.z,at=e.now}
+            elseif e.now-self.progress.at>=0.45 then self:cancel(e,'no physical progress') end
+            if self.route then
+                local result,why,when=self:evaluate(e,self.route.points,0.1)
+                if result then
+                    self.invalidSince=nil
+                    return command
+                end
+                -- Imminent threats interrupt at once. A distant forecast
+                -- must persist across updates, never just win a score tie.
+                if when>0.22 and why~='wall' and why~='refuge boundary' then
+                    self.invalidSince=self.invalidSince or e.now
+                    if e.now-self.invalidSince<0.1 then return command end
+                end
+                self:cancel(e,why)
+            end
+        end
+    end
+    local native=e.native or {x=0,z=0}
+    local nativeLength=sqrt(native.x^2+native.z^2)
+    local safeNative=false
+    if nativeLength>0.05 then
+        local target={x=e.x+native.x/nativeLength*e.speed*0.4,z=e.z+native.z/nativeLength*e.speed*0.4}
+        local result=self:evaluate(e,{target},0)
+        safeNative=result~=nil and result.peak<0.12
+    else
+        safeNative=self:evaluate(e,{},0.4)~=nil
+    end
+    local enemy=e.enemy and e.enemy(e.x,e.z,0) or huge
+    if e.mode=='rows' and self:evaluate(e,{},0.6) and enemy>=9 then
+        return {kind='hold',reason='aligned in checked row opening',holdAttack=false}
+    end
+    local specialized=e.mode=='entry' or e.mode=='refuge' or e.mode=='rows'
+    -- Do not turn clean dungeon travel into constant evasion. Native room
+    -- navigation remains responsible for long paths and doorway traversal.
+    if not specialized and safeNative and enemy>=28 then
+        self.nextPlan=0
+        if e.recoverNavigation and nativeLength>0.05 then
+            return {kind='navigate',dx=native.x/nativeLength,dz=native.z/nativeLength,
+                reason='checked navigation recovery'}
+        end
+        return {kind='yield',reason='checked native navigation'}
+    end
+    if e.now<self.nextPlan then
+        return {kind='hold',reason='no checked route; retry pending',holdAttack=false}
+    end
+    self.nextPlan=e.now+0.05
+    local points,cost=self:choose(e)
+    if points then
+        self.serial=self.serial+1
+        self.route={id=self.serial,points=points,created=e.now}
+        self.progress={x=e.x,z=e.z,at=e.now}
+        self:log(e,'commit', {cost=cost,targetX=points[#points].x,targetZ=points[#points].z,waypoints=#points})
+        return self:command(e,'new predicted path')
+    end
+    if e.now-self.lastLog>=0.25 then
+        self.lastLog=e.now
+        self:log(e,'no checked route',{rejects=self.lastRejects})
+    end
+    return {kind='hold',reason='no checked route',holdAttack=false}
+end
+return Planner
 
+    end)()
+    local install=(function()
+-- Installed after existing components; the planner is embedded in the loader.
+return function(context, Planner)
+    local rt, world, player = context.RT, context.Workspace, context.LocalPlayer
+    local planner=Planner.new()
+    local report={build='V7-predictive-waypoints-1',frames=0,errors=0,decisions={},healthEvents={}}
+    local character, rays, lastNative, wasOwned, lastCall=nil,nil,nil,false,-math.huge
+    local lastHealth, lastMode, lastSpot=nil,nil,nil
+    local lastRowsAt, nativeIdleAt=-math.huge,os.clock()
+    local lastSnapshotAt, snapshot, lastCommand=-math.huge,nil,nil
+    local forcedLook,savedRotate=false,true
+    local function log(reason,extra)
+        local event={at=os.clock(),reason=reason}
+        for k,v in pairs(extra or {}) do event[k]=v end
+        report.decisions[#report.decisions+1]=event
+        if #report.decisions>120 then table.remove(report.decisions,1) end
+    end
+    local function hazardSnapshot()
+        local out={}
+        for _,box in ipairs(context.DG and context.DG.boxes or {}) do
+            if #out>=60 then break end
+            local copy={}
+            for key,v in pairs(box) do
+                if type(key)=='string' and (type(v)=='string' or type(v)=='boolean'
+                    or type(v)=='number' and v==v and math.abs(v)<math.huge) then copy[key]=v end
+            end
+            out[#out+1]=copy
+        end
+        return out
+    end
+    local function command(h,cmd,now)
+        local direction=cmd and (cmd.kind=='move' or cmd.kind=='navigate') and Vector3.new(cmd.dx,0,cmd.dz) or Vector3.zero
+        local mv=context.MV
+        if mv then
+            mv.cmdDir=direction.Magnitude>0.01 and direction or nil
+            mv.cmdAt=rt.brainNow or now
+            mv.driving=direction.Magnitude>0.01
+        end
+        if context.LC and context.LC.steer then context.LC.steer(direction.Magnitude>0.01 and direction or nil) end
+        h:Move(direction,false)
+        if cmd and cmd.holdAttack then rt.v7DodgeAttackHold=now+0.15 end
+        rt.movementState='V7: '..(cmd and cmd.reason or 'hold')
+    end
+    local function applyLook(h,root)
+        local look
+        if context.gsLookPoint then
+            local ok,p=pcall(context.gsLookPoint,root.Position)
+            if ok then look=p end
+        end
+        if not look and rt.gsLookSince and rt.gsLook and rt.gsLook.src then
+            local src=rt.gsLook.src
+            local dx,dz=root.Position.X-src.X,root.Position.Z-src.Z
+            if rt.gsLook.toward then dx,dz=-dx,-dz end
+            local n=math.sqrt(dx*dx+dz*dz)
+            if n>0.01 then look=root.Position+Vector3.new(dx/n*20,0,dz/n*20) end
+        end
+        if look then
+            if not forcedLook then savedRotate=h.AutoRotate end
+            forcedLook=true
+            h.AutoRotate=false
+            local flat=Vector3.new(look.X,root.Position.Y,look.Z)
+            if (flat-root.Position).Magnitude>0.01 then root.CFrame=CFrame.lookAt(root.Position,flat) end
+        elseif forcedLook then h.AutoRotate=savedRotate forcedLook=false end
+    end
+    local function tick(phase)
+        local now=os.clock()
+        if rt.destroyed or not rt.farmEnabled then
+            planner:reset()
+            if wasOwned then
+                local h=player.Character and player.Character:FindFirstChildOfClass('Humanoid')
+                if h then h:Move(Vector3.zero,false) end
+            end
+            wasOwned=false
+            lastCommand=nil
+            return
+        end
+        local ch=player.Character
+        local h=ch and ch:FindFirstChildOfClass('Humanoid')
+        local root=ch and ch:FindFirstChild('HumanoidRootPart')
+        if not h or not root then return end
+        if ch~=character then
+            character=ch
+            planner:reset()
+            lastNative,lastHealth,wasOwned=nil,h.Health,false
+            lastRowsAt,nativeIdleAt=-math.huge,now
+            lastSnapshotAt,lastCall=-math.huge,-math.huge
+            lastCommand=nil
+            rays=RaycastParams.new()
+            rays.FilterType=Enum.RaycastFilterType.Exclude
+            rays.RespectCanCollide=true
+            rays.FilterDescendantsInstances={ch}
+            forcedLook=false
+        end
+        report.frames=report.frames+1
+        if lastHealth and h.Health<lastHealth then
+            report.healthEvents[#report.healthEvents+1]={at=now,lost=lastHealth-h.Health,
+                reason=lastCommand and lastCommand.reason,route=planner.route and planner.route.id,
+                x=root.Position.X,z=root.Position.Z,hazards=hazardSnapshot()}
+            if #report.healthEvents>12 then table.remove(report.healthEvents,1) end
+        end
+        lastHealth=h.Health
+        if h.Health<=0 then planner:reset() return end
+        applyLook(h,root)
+        -- Preserve real game movement holds; never overwrite a stun with 27.
+        if root.Anchored or h.WalkSpeed<=0 then
+            planner:reset()
+            if wasOwned then h:Move(Vector3.zero,false) end
+            wasOwned,lastCommand,lastNative=false,nil,nil
+            report.lastDecision='game movement hold'
+            return
+        end
+        h.WalkSpeed=27
+        if phase=='post-main' or not wasOwned then
+            lastNative={x=h.MoveDirection.X,z=h.MoveDirection.Z,at=now}
+            if h.MoveDirection.Magnitude>0.05 then nativeIdleAt=now end
+        end
+        -- Post-main and pre-physics may run on the same snapshot. Reapply
+        -- the final command instead of running two independent decisions.
+        if now-lastCall<0.008 and lastCommand then
+            if lastCommand.kind~='yield' then command(h,lastCommand,now) end
+            return
+        end
+        lastCall=now
+        local pos=root.Position
+        local field=context.RD and context.RD.safeField
+        local spots=field and (field.gsSpots or context.RD.safeSpots)
+        local mode,modeKey,goal,circle='normal','normal',nil,nil
+        local activeRefuge=field and field.name=='archpriestsafezones' and type(spots)=='table'
+            and #spots>0 and now>=(field.from or now)-3 and now<=(field.untilAt or now)
+        if activeRefuge then
+            local chosen,nearest=nil,math.huge
+            for _,spot in ipairs(spots) do
+                if not spot.part or (spot.part.Parent and spot.part.Transparency<0.95) then
+                    local d=(pos.X-spot.x)^2+(pos.Z-spot.z)^2
+                    local r=math.max(2,(spot.r or 0)-math.max(3,context.CFG.gsSafeEdge or 1))
+                    if d<=r*r then chosen=spot break end
+                    local preference=lastSpot and (spot.x-lastSpot.x)^2+(spot.z-lastSpot.z)^2<1 and -25 or 0
+                    if d+preference<nearest then nearest,chosen=d+preference,spot end
+                end
+            end
+            if chosen then
+                lastSpot={x=chosen.x,z=chosen.z}
+                local r=math.max(2,(chosen.r or 0)-math.max(3,context.CFG.gsSafeEdge or 1))
+                goal={x=chosen.x,z=chosen.z}
+                if (pos.X-chosen.x)^2+(pos.Z-chosen.z)^2<=r*r then
+                    mode='refuge'
+                    circle={x=chosen.x,z=chosen.z,r=r}
+                    goal=nil
+                else mode='entry' end
+                modeKey=mode..':'..math.floor(chosen.x)..':'..math.floor(chosen.z)
+            end
+        else
+            if context.gsB1Lanes and context.gsB1Lanes(now) then lastRowsAt=now end
+            if now-lastRowsAt<0.5 then mode,modeKey='rows','rows' end
+        end
+        if not goal and mode=='normal' then
+            local brain=context.BR
+            local g=brain and (brain.goTo or brain.target and brain.target.root and brain.target.root.Position)
+            if g then goal={x=g.X,z=g.Z} end
+        end
+        if now-lastSnapshotAt>=0.05 or modeKey~=lastMode then
+            snapshot={enemies={}}
+            for _,enemy in ipairs(context.RD and context.RD.enemies or {}) do
+                local r=enemy.root
+                local eh=enemy.humanoid or enemy.model and enemy.model:FindFirstChildOfClass('Humanoid')
+                if r and r.Parent and (not eh or eh.Health>0) then
+                    local velocity=r.AssemblyLinearVelocity
+                    snapshot.enemies[#snapshot.enemies+1]={x=r.Position.X,z=r.Position.Z,
+                        vx=math.clamp(velocity.X,-60,60),vz=math.clamp(velocity.Z,-60,60)}
+                end
+            end
+            lastSnapshotAt=now
+        end
+        lastMode=modeKey
+        local riskCache,wallCache,roomCache={},{},{}
+        local samples=0
+        local function skip(box)
+            return activeRefuge and tostring(box.name or '')==tostring(field.name)
+        end
+        local ping=tonumber(rt.pingS or rt.dataPingS) or 0
+        if ping>2 then ping=ping/1000 end
+        local margin=math.clamp(ping*0.5+0.04,0.04,0.2)
+        local e={now=now,x=pos.X,z=pos.Z,speed=27,mode=mode,modeKey=modeKey,goal=goal,circle=circle,
+            native=lastNative and now-lastNative.at<0.25 and lastNative or {x=0,z=0}}
+        if mode=='normal' and goal and now-nativeIdleAt>0.45 then
+            local dx,dz=goal.x-pos.X,goal.z-pos.Z
+            local n=math.sqrt(dx*dx+dz*dz)
+            if n>4 then e.native={x=dx/n,z=dz/n} e.recoverNavigation=true end
+        end
+        e.risk=function(x,z,t)
+            local key=string.format('%.1f:%.1f:%.2f',x,z,t)
+            if riskCache[key]~=nil then return riskCache[key] end
+            samples=samples+1
+            -- A bounded search must never label unchecked samples safe.
+            if samples>3500 then return math.huge end
+            local v=math.max(context.dangerAt(x,pos.Y,z,math.max(0,t-margin),nil,nil,skip,true),
+                context.dangerAt(x,pos.Y,z,t+margin,nil,nil,skip,true))
+            riskCache[key]=v
+            return v
+        end
+        e.wall=function(ax,az,bx,bz)
+            local key=string.format('%.1f:%.1f:%.1f:%.1f',ax,az,bx,bz)
+            if wallCache[key]~=nil then return wallCache[key] end
+            local delta=Vector3.new(bx-ax,0,bz-az)
+            if delta.Magnitude<0.01 then return false end
+            local side=Vector3.new(-delta.Z,0,delta.X).Unit
+            local blocked=false
+            for _,offset in ipairs({0,-1.5,1.5}) do
+                if world:Raycast(Vector3.new(ax,pos.Y+1.5,az)+side*offset,delta,rays) then blocked=true break end
+            end
+            if not blocked then
+                -- Empty space beyond a ledge is not a walkable dodge route.
+                local steps=math.max(1,math.ceil(delta.Magnitude/3))
+                for i=1,steps do
+                    local f=i/steps
+                    local support=world:Raycast(Vector3.new(ax+(bx-ax)*f,pos.Y+3,az+(bz-az)*f),
+                        Vector3.new(0,-18,0),rays)
+                    if not support then blocked=true break end
+                end
+            end
+            wallCache[key]=blocked
+            return blocked
+        end
+        e.projectile=function(ax,az,bx,bz,start,duration)
+            local dx,dz=bx-ax,bz-az
+            local length=math.sqrt(dx*dx+dz*dz)
+            local dir=length>0.001 and Vector3.new(dx/length,0,dz/length) or Vector3.zero
+            local hit=context.projectileImpact(Vector3.new(ax,pos.Y,az),dir,length>0.001 and 27 or 0,duration,start)
+            if hit<math.huge then return hit end
+            return false
+        end
+        e.enemy=function(x,z,t)
+            local nearest=math.huge
+            for _,enemy in ipairs(snapshot.enemies) do
+                local age=math.min(0.1,now-lastSnapshotAt)
+                local dx,dz=x-enemy.x-enemy.vx*(t+age),z-enemy.z-enemy.vz*(t+age)
+                nearest=math.min(nearest,math.sqrt(dx*dx+dz*dz))
+            end
+            return nearest
+        end
+        e.room=function(x,z)
+            local key=string.format('%.1f:%.1f',x,z)
+            if roomCache[key] then return roomCache[key] end
+            local room=10
+            for i=0,3 do
+                local angle=i*math.pi/2
+                local hit=world:Raycast(Vector3.new(x,pos.Y+1.5,z),Vector3.new(math.cos(angle),0,math.sin(angle))*10,rays)
+                if hit then room=math.min(room,hit.Distance) end
+            end
+            roomCache[key]=room
+            return room
+        end
+        local cmd=planner:step(e)
+        if cmd.kind=='yield' then
+            if wasOwned then
+                local native=e.native
+                local direction=Vector3.new(native.x,0,native.z)
+                h:Move(direction,false)
+                if context.MV then
+                    context.MV.cmdDir=direction.Magnitude>0.01 and direction or nil
+                    context.MV.driving=direction.Magnitude>0.01
+                end
+            end
+            wasOwned=false
+        else
+            wasOwned=true
+            command(h,cmd,now)
+        end
+        lastCommand=cmd
+        report.lastDecision,report.mode,report.route,report.samples=cmd.reason,mode,cmd.route,samples
+        report.position={x=pos.X,z=pos.Z}
+        report.rejections=planner.lastRejects
+    end
+    context.V7Dodge=report
+    context.V6RoomEntry=report -- compatibility with existing report consumers
+    _G.HL_V6_CONTROLLER_REPORT=report
+    _G.HL_V7_DODGE={report=report,planner=planner,simulate=function(frames)
+        -- Pure replay: a separate planner; never moves the live character.
+        local replay,commands=Planner.new(),{}
+        for _,frame in ipairs(frames) do commands[#commands+1]=replay:step(frame) end
+        return commands,replay.events
+    end,dump=function()
+        return game:GetService('HttpService'):JSONEncode({build=report.build,decision=report.lastDecision,
+            mode=report.mode,errors=report.errors,lastError=report.lastError,events=planner.events,
+            healthEvents=report.healthEvents,rejections=report.rejections,
+            lastWorkMs=report.lastWorkMs,maxWorkMs=report.maxWorkMs})
+    end}
+    context.v6FinalizeMovement=function(phase)
+        local started=os.clock()
+        local ok,err=pcall(tick,phase)
+        report.lastWorkMs=(os.clock()-started)*1000
+        report.maxWorkMs=math.max(report.maxWorkMs or 0,report.lastWorkMs)
+        if not ok then
+            report.errors=report.errors+1
+            report.lastError=tostring(err)
+            if os.clock()-(report.lastWarn or -math.huge)>2 then
+                report.lastWarn=os.clock()
+                warn('[HL V7 dodge] '..tostring(err))
+            end
+            planner:reset()
+        end
+    end
+    report.connection=(context.RunService.PreSimulation or context.RunService.Heartbeat):Connect(function()
+        context.v6FinalizeMovement('pre-physics')
+    end)
+    local destroy=_G.DungeonAutofarmDestruct
+    if type(destroy)=='function' then
+        _G.DungeonAutofarmDestruct=function(...)
+            report.connection:Disconnect()
+            local h=player.Character and player.Character:FindFirstChildOfClass('Humanoid')
+            if h and forcedLook then h.AutoRotate=savedRotate end
+            return destroy(...)
+        end
+    end
+    log('predictive planner installed')
+end
+
+    end)()
+    install(context, Planner)
+end
+-- END V7 PREDICTIVE DODGE
+return context
