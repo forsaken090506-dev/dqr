@@ -36729,7 +36729,7 @@ components.dangerGeometry = function(context)
     end)
     context.GS_NOMELEE = HLGS == true
     context.GS_EMPTY = {}
-    local function dangerAt(argument, argument2, argument3, argument4, argument5, argument6, argument7)
+    local function dangerAt(argument, argument2, argument3, argument4, argument5, argument6, argument7, ignoreProtectionEstimate)
         local value, value2, value3, value4, value5 =
             argument5 or dangerGeometry.reach,
             dangerGeometry.halfHeight,
@@ -36738,7 +36738,7 @@ components.dangerGeometry = function(context)
             dangerGeometry.boxes
         argument6 = value4 + argument4
         if context.RT then
-            if context.RT.gsInvEnd then
+            if context.RT.gsInvEnd and not ignoreProtectionEstimate then
                 if argument6 <= context.RT.gsInvEnd then
                     return 0
                 end
@@ -68453,15 +68453,14 @@ components.movementCombat = function(context)
         local value4, value5 = (field.from or gsFloorAt) - gsFloorAt, tostring(field.name or "")
         local function helper3(argument2)
             local value6 = tostring(argument2.name or "")
-            -- Hardcore: evaluate the entire hazard field, not just the
-            -- active safe-zone mechanic. Otherwise a nominally safe spot
-            -- can overlap a separate beam, orb, or floor attack.
-            if _G.HL_V4_HARDCORE_ACTIVE then
-                return true
-            end
+            -- This callback is an exclusion filter: returning true for
+            -- every hazard accidentally disabled all overlap checks.
             return value6 == value5
                 or value6:find("safe", 1, true) ~= nil
                 or context.gsIsBlockBox and context.gsIsBlockBox(argument2)
+        end
+        local function refugeDanger(x, y, z, lead, reach, shoulder, filter)
+            return dangerAt(x, y, z, lead, reach, shoulder, filter, true)
         end
         local function helper6(vector2, vector3, argument2)
             local value6 = horizontalDistance(vector2, vector3)
@@ -68469,7 +68468,7 @@ components.movementCombat = function(context)
                 math.max(1, math.ceil(value6 / (capturedContext[1].gsSafeWayStep or 6))), 0, 0
             for index = 1, value7, 1 do
                 local value10 = index / value7
-                index = dangerAt(
+                index = refugeDanger(
                     vector2.X + (vector3.X - vector2.X) * value10,
                     vector.Y,
                     vector2.Z + (vector3.Z - vector2.Z) * value10,
@@ -68516,12 +68515,12 @@ components.movementCombat = function(context)
                     horizontalDistance(vector, value16),
                     math.max(entry2.r - (capturedContext[1].safeInset or 6), 2) * 0.7
                 index3 = safety / value3
-                local value19 = dangerAt(value16.X, vector.Y, value16.Z, index3, nil, nil, helper3)
+                local value19 = refugeDanger(value16.X, vector.Y, value16.Z, index3, nil, nil, helper3)
                 for index4 = 0, 5, 1 do
                     local value20 = index4 * 3.141592653589793 / 3
                     value19 = math.max(
                         value19,
-                        dangerAt(
+                        refugeDanger(
                             value16.X + math.cos(value20) * value18,
                             vector.Y,
                             value16.Z + math.sin(value20) * value18,
@@ -68537,7 +68536,7 @@ components.movementCombat = function(context)
                 -- the character reaches the selected spot.
                 if _G.HL_V4_HARDCORE_ACTIVE then
                     local futureOffset = 0.45
-                    value19 = math.max(value19, dangerAt(
+                    value19 = math.max(value19, refugeDanger(
                         value16.X, vector.Y, value16.Z,
                         index3 + futureOffset, nil, nil, helper3
                     ))
@@ -94740,6 +94739,35 @@ components.movementCombat = function(context)
                 value8
             )
     end
+    context.archRefugeTick = function(humanoid, root, now)
+        local field = capturedContext[3].safeField
+        local spots = field and (field.gsSpots or capturedContext[3].safeSpots)
+        if not field or field.name ~= "archpriestsafezones" or type(spots) ~= "table"
+            or #spots == 0 or now < (field.from or now) - 3
+            or now > (field.untilAt or now) then return false end
+        if not context.gsSafePick then return false end
+        local ok, spot, via = pcall(context.gsSafePick,
+            root.Position, field, spots, now, context.speedNormal())
+        if not ok then
+            capturedContext[2].lastError = "refuge entry: " .. tostring(spot)
+            return false
+        end
+        if not spot then return false end
+        local dx, dz = root.Position.X - spot.x, root.Position.Z - spot.z
+        local inset = math.max((spot.r or 0) - math.max(3, capturedContext[1].gsSafeEdge or 1), 2)
+        combatBrain.waypoints = nil
+        capturedContext[2].gsZP = nil
+        if dx * dx + dz * dz <= inset * inset then
+            releaseMover(humanoid, root)
+            humanoid:Move(Vector3.zero, false)
+            setState("SAFE SPOT: holding inside first-boss refuge")
+        else
+            helper2(humanoid, root, via or Vector3.new(spot.x, root.Position.Y, spot.z),
+                context.speedNormal(), 0.5)
+            setState("SAFE SPOT: entering first-boss refuge")
+        end
+        return true
+    end
     local function brainTick(argument)
         local value2 = {}
         if context.gsLookTick then
@@ -94804,6 +94832,8 @@ components.movementCombat = function(context)
             setState("held in place by the game (stun) - waiting")
             return
         end
+        -- Refuge entry precedes idle, target, dodge and travel branches.
+        if context.archRefugeTick(humanoid, value5, argument) then return end
         if context.idleGuardTick then
             local success2, value6, value7 = pcall(context.idleGuardTick, argument, value5, humanoid)
             if success2 then
@@ -165831,7 +165861,7 @@ do
     local sensedRoots, sensorAt = {}, -math.huge
     local forcedLook = false
     local savedAutoRotate = true
-    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-23-short-wall-step" }
+    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-23-refuge-priority-environment" }
     -- Run after render/player input and immediately before physical movement.
     local motionSignal = runService.PreSimulation or runService.RenderStepped or runService.Heartbeat
     _G.HL_V6_CONTROLLER_REPORT = context.V6RoomEntry
@@ -165908,10 +165938,13 @@ do
         local pingLead = math.clamp((tonumber(pingS) or 0) + 0.16, 0, 0.60)
         -- A latency forecast must not erase an attack that is active now
         -- but expires before the predicted arrival time.
+        local function strictDanger(x, y, z, lead)
+            return context.dangerAt(x, y, z, lead, nil, nil, nil, true)
+        end
         local function routeDanger(x, y, z, lead)
-            local live = context.dangerAt(x, y, z, lead)
-            local predicted = context.dangerAt(x, y, z, lead + pingLead)
-            local activeNow = context.dangerAt(x, y, z, 0)
+            local live = strictDanger(x, y, z, lead)
+            local predicted = strictDanger(x, y, z, lead + pingLead)
+            local activeNow = strictDanger(x, y, z, 0)
             if type(live) ~= "number" or type(predicted) ~= "number"
                 or type(activeNow) ~= "number" then
                 return math.huge
@@ -166020,6 +166053,11 @@ do
             context.V6RoomEntry.waiting = false
             committedDir, commitUntil, routeDir, lastCommandDir = nil, 0, nil, nil
             report.lastDecision = "yield: green refuge owner"
+            if context.archRefugeTick then
+                local ok, handled = pcall(context.archRefugeTick, humanoid, root, now)
+                if ok and handled then report.lastDecision = "green refuge: priority movement"
+                elseif not ok then report.lastError = tostring(handled) end
+            end
             idleAt = now
             return
         end
@@ -166310,7 +166348,7 @@ do
             local basis = dir.Unit
             local best, bestScore = basis, math.huge
             local fallback, fallbackScore, fallbackExit = nil, math.huge, math.huge
-            local activeOk, activeStart = pcall(context.dangerAt,
+            local activeOk, activeStart = pcall(strictDanger,
                 root.Position.X, root.Position.Y, root.Position.Z, 0)
             local startsClear = activeOk and type(activeStart) == "number" and activeStart < riskLimit
             local activeBlocked, physicalChoices = 0, 0
@@ -166465,7 +166503,7 @@ do
                 for index = 0, math.ceil((1.25 + pingLead) / 0.05) do
                     if not canWait then break end
                     local lead = index * 0.05
-                    local ok, risk = pcall(context.dangerAt,
+                    local ok, risk = pcall(strictDanger,
                         root.Position.X, root.Position.Y, root.Position.Z, lead)
                     canWait = ok and type(risk) == "number" and risk < riskLimit
                         and enemyDistance(root.Position, lead) >= 38
