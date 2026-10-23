@@ -2,10 +2,11 @@
 return function(context, Planner)
     local rt, world, player = context.RT, context.Workspace, context.LocalPlayer
     local planner=Planner.new()
-    local report={build='V7-predictive-waypoints-1',frames=0,errors=0,decisions={},healthEvents={}}
+    local report={build='V7-predictive-waypoints-2-visible-refuge',frames=0,errors=0,decisions={},healthEvents={}}
     local character, rays, lastNative, wasOwned, lastCall=nil,nil,nil,false,-math.huge
     local lastHealth, lastMode, lastSpot=nil,nil,nil
     local lastRowsAt, nativeIdleAt=-math.huge,os.clock()
+    local refugeScanAt, visibleRefuges=-math.huge,{}
     local lastSnapshotAt, snapshot, lastCommand=-math.huge,nil,nil
     local forcedLook,savedRotate=false,true
     local function log(reason,extra)
@@ -123,8 +124,53 @@ return function(context, Planner)
         local pos=root.Position
         local field=context.RD and context.RD.safeField
         local spots=field and (field.gsSpots or context.RD.safeSpots)
+        -- The field reader can lag behind the visible green precasts. Read
+        -- only named boss refuge models, never arbitrary green world parts.
+        local bossPresent=false
+        for _,enemy in ipairs(context.RD and context.RD.enemies or {}) do
+            local name=enemy.model and string.lower(enemy.model.Name) or ''
+            if name:find('archpriest',1,true) or name:find('kiryne',1,true) then bossPresent=true break end
+        end
+        if bossPresent and world.GetDescendants and now-refugeScanAt>=0.12 then
+            refugeScanAt,visibleRefuges=now,{}
+            for _,model in ipairs(world:GetDescendants()) do
+                local name=string.lower(model.Name)
+                if (name=='thirdbossmasssafespotcircles' or name=='archpriestsafezones')
+                    and model:IsA('Model') then
+                    for _,part in ipairs(model:GetDescendants()) do
+                        if part:IsA('BasePart') and string.lower(part.Name):find('precast',1,true)
+                            and part.Parent and part.Transparency<0.95 then
+                            local size=part.Size
+                            local lo,hi=math.min(size.X,size.Y,size.Z),math.max(size.X,size.Y,size.Z)
+                            local diameter=size.X+size.Y+size.Z-lo-hi
+                            local colour=part.Color
+                            if diameter>=4 and diameter<=120 and colour.G>colour.R*1.2
+                                and colour.G>colour.B*1.15 and math.abs(part.Position.Y-pos.Y)<14 then
+                                visibleRefuges[#visibleRefuges+1]={x=part.Position.X,z=part.Position.Z,r=diameter/2,part=part}
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        local direct={}
+        if bossPresent then
+            for _,spot in ipairs(visibleRefuges) do
+                if spot.part.Parent and spot.part.Transparency<0.95 then direct[#direct+1]=spot end
+            end
+        end
+        local readerUsable=field and (field.name=='archpriestsafezones' or field.name=='thirdbossmasssafespotcircles')
+            and type(spots)=='table' and #spots>0
+            and now<=(field.untilAt or now)
+        if not readerUsable and #direct>0 then
+            spots=direct
+            field={name='archpriestsafezones',from=now,untilAt=now+0.2,gsSpots=spots}
+            report.refugeSource='visible boss precasts'
+        else report.refugeSource='hazard reader' end
+        report.visibleRefuges=#direct
         local mode,modeKey,goal,circle='normal','normal',nil,nil
-        local activeRefuge=field and field.name=='archpriestsafezones' and type(spots)=='table'
+        local activeRefuge=field and (field.name=='archpriestsafezones' or field.name=='thirdbossmasssafespotcircles')
+            and type(spots)=='table'
             and #spots>0 and now>=(field.from or now)-3 and now<=(field.untilAt or now)
         if activeRefuge then
             local chosen,nearest=nil,math.huge
@@ -174,7 +220,9 @@ return function(context, Planner)
         local riskCache,wallCache,roomCache={},{},{}
         local samples=0
         local function skip(box)
-            return activeRefuge and tostring(box.name or '')==tostring(field.name)
+            local name=string.lower(tostring(box.name or ''))
+            return activeRefuge and (name==string.lower(tostring(field.name))
+                or name=='archpriestsafezones' or name=='thirdbossmasssafespotcircles')
         end
         local ping=tonumber(rt.pingS or rt.dataPingS) or 0
         if ping>2 then ping=ping/1000 end
@@ -281,6 +329,7 @@ return function(context, Planner)
     end,dump=function()
         return game:GetService('HttpService'):JSONEncode({build=report.build,decision=report.lastDecision,
             mode=report.mode,errors=report.errors,lastError=report.lastError,events=planner.events,
+            refugeSource=report.refugeSource,visibleRefuges=report.visibleRefuges,
             healthEvents=report.healthEvents,rejections=report.rejections,
             lastWorkMs=report.lastWorkMs,maxWorkMs=report.maxWorkMs})
     end}
