@@ -165831,7 +165831,7 @@ do
     local sensedRoots, sensorAt = {}, -math.huge
     local forcedLook = false
     local savedAutoRotate = true
-    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-22-prompt-e-live-floor" }
+    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-23-short-wall-step" }
     -- Run after render/player input and immediately before physical movement.
     local motionSignal = runService.PreSimulation or runService.RenderStepped or runService.Heartbeat
     _G.HL_V6_CONTROLLER_REPORT = context.V6RoomEntry
@@ -166136,12 +166136,12 @@ do
             end
             return closest
         end
-        local function laneOpen(candidate, requireHazardSafe)
+        local function laneOpen(candidate, requireHazardSafe, shortReach)
             if not candidate or candidate.Magnitude <= 0.01 then return false end
             candidate = candidate.Unit
             local origin = root.Position + Vector3.new(0, 1.5, 0)
             local side = Vector3.new(-candidate.Z, 0, candidate.X)
-            local reach = math.max(8, math.min(13, humanoid.WalkSpeed * 0.60))
+            local reach = shortReach or math.max(8, math.min(13, humanoid.WalkSpeed * 0.60))
             -- A centre ray can clear a corner while the avatar's shoulder
             -- still collides with it. Require a body-width corridor.
             for _, offset in ipairs({0, -1.5, 1.5}) do
@@ -166152,7 +166152,9 @@ do
                 if not castOk or hit then return false end
             end
             if requireHazardSafe and context.dangerAt then
+                local maxLead = shortReach and shortReach / math.max(humanoid.WalkSpeed, 12) or math.huge
                 for _, travelLead in ipairs(routeSamples) do
+                    if travelLead > maxLead then break end
                     local point = root.Position
                         + candidate * math.max(humanoid.WalkSpeed, 12) * travelLead
                     local ok, risk = pcall(
@@ -166165,6 +166167,11 @@ do
                     if not ok or type(risk) ~= "number" or risk >= riskLimit then
                         return false
                     end
+                end
+                if shortReach then
+                    local point = root.Position + candidate * shortReach
+                    local ok, risk = pcall(routeDanger, point.X, point.Y, point.Z, maxLead)
+                    if not ok or type(risk) ~= "number" or risk >= riskLimit then return false end
                 end
             end
             return true
@@ -166284,6 +166291,7 @@ do
         lastScanAt = now
         local dir
         local activeFloorTrapped = false
+        local shortWallStep = false
         local brain = context.BR
         local goal = brain and (brain.goTo or brain.target and brain.target.root and brain.target.root.Position)
         if goal then
@@ -166305,7 +166313,7 @@ do
             local activeOk, activeStart = pcall(context.dangerAt,
                 root.Position.X, root.Position.Y, root.Position.Z, 0)
             local startsClear = activeOk and type(activeStart) == "number" and activeStart < riskLimit
-            local activeBlocked = 0
+            local activeBlocked, physicalChoices = 0, 0
             for index = 0, 15 do
                 local angle = index * math.pi / 8
                 local c, s = math.cos(angle), math.sin(angle)
@@ -166324,6 +166332,7 @@ do
                 local lastUnsafe = 0
                 local activeCleared, crossesActive = startsClear, false
                 local physicalOpen = laneOpen(candidate, false)
+                if physicalOpen then physicalChoices = physicalChoices + 1 end
                 -- Reject escape headings that cannot physically carry the
                 -- avatar clear. This is the wall-trap shown in the 17:14
                 -- recording: dangerAt saw empty space beyond the wall and the
@@ -166421,6 +166430,33 @@ do
                 end
                 if not hardUnsafe and score < bestScore then best, bestScore = candidate, score end
             end
+            if bestScore == math.huge and physicalChoices == 0 then
+                -- A 13-stud straight corridor is not required to take one
+                -- safe step around a nearby corner. Try short body-width
+                -- corridors before declaring that all movement is blocked.
+                for index = 0, 15 do
+                    local angle = index * math.pi / 8
+                    local c, sn = math.cos(angle), math.sin(angle)
+                    local candidate = Vector3.new(basis.X * c - basis.Z * sn, 0,
+                        basis.X * sn + basis.Z * c)
+                    if laneOpen(candidate, true, 3.5) then
+                        local point = root.Position + candidate * 3.5
+                        local currentDistance = enemyDistance(root.Position)
+                        local futureDistance = enemyDistance(point, 3.5 / math.max(humanoid.WalkSpeed, 12) + pingLead)
+                        if futureDistance >= math.min(30, currentDistance) - 0.5 then
+                            local score = (1 - candidate:Dot(basis)) * 0.35
+                                + (failedHeading(candidate, now) and 25000 or 0)
+                            if lastCommandDir then
+                                local turn = 1 - math.clamp(candidate:Dot(lastCommandDir), -1, 1)
+                                score = score + turn * turn * 15
+                            end
+                            if score < bestScore then
+                                best, bestScore, shortWallStep = candidate, score, true
+                            end
+                        end
+                    end
+                end
+            end
             if bestScore == math.huge then
                 -- Waiting is valid only if the whole stationary interval
                 -- remains clear of both attacks and approaching enemies.
@@ -166509,7 +166545,12 @@ do
         if dir.Magnitude > 0.01 then
             context.V6RoomEntry.waiting = false
             routeDir = dir.Unit
-            if moving then
+            if shortWallStep then
+                -- This is a local corner step, not a long escape commitment.
+                -- Re-evaluate the geometry on the next frame.
+                committedDir, commitUntil, lastScanAt = nil, 0, -math.huge
+                report.wallSteps = (report.wallSteps or 0) + 1
+            elseif moving then
                 committedDir = routeDir
                 commitUntil = now + (enemyEmergency and 0.70 or 1.25)
             end
