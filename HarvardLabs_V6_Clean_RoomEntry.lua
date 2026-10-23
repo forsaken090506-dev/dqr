@@ -94739,6 +94739,90 @@ components.movementCombat = function(context)
                 value8
             )
     end
+    context.archRefugeCircle = function(humanoid, root, spot, field, now)
+        local rt = capturedContext[2]
+        local orbit = rt.archRefugeOrbit
+        if not orbit or orbit.field ~= field or orbit.spot ~= spot then
+            orbit = {field = field, spot = spot, sign = 1}
+            rt.archRefugeOrbit = orbit
+        end
+        local inset = math.max((spot.r or 0) - math.max(3, capturedContext[1].gsSafeEdge or 1), 2)
+        local radius = math.max(0.5, math.min((spot.r or 0) * 0.55, inset - 1))
+        local angle = math.atan2(root.Position.Z - spot.z, root.Position.X - spot.x)
+        local speed = context.speedNormal()
+        local ping = math.clamp(tonumber(rt.pingS or rt.dataPingS) or 0, 0, 0.6)
+        local function skipField(box) return tostring(box.name or "") == tostring(field.name) end
+        local function riskAt(point, lead)
+            local active = dangerAt(point.X, point.Y, point.Z, 0, nil, nil, skipField, true)
+            return math.max(
+                active,
+                dangerAt(point.X, point.Y, point.Z, lead, nil, nil, skipField, true),
+                dangerAt(point.X, point.Y, point.Z, lead + ping + 0.1, nil, nil, skipField, true)), active
+        end
+        local startRisk, startActive = riskAt(root.Position, 0)
+        if not orbit.rays then
+            orbit.rays = RaycastParams.new()
+            orbit.rays.FilterType = Enum.RaycastFilterType.Exclude
+            orbit.rays.FilterDescendantsInstances = {localPlayer.Character}
+            orbit.rays.RespectCanCollide = true
+        end
+        local best, bestSign, bestScore = nil, orbit.sign, math.huge
+        local function consider(point, sign, preference)
+            local delta = Vector3.new(point.X - root.Position.X, 0, point.Z - root.Position.Z)
+            if delta.Magnitude < 0.2 then return end
+            local direction = delta.Unit
+            -- Check beyond the waypoint for a short frame delay as well.
+            local distance = math.max(delta.Magnitude, speed * 0.08)
+            local endpoint = root.Position + direction * distance
+            local ex, ez = endpoint.X - spot.x, endpoint.Z - spot.z
+            if ex * ex + ez * ez > inset * inset then return end
+            local side = Vector3.new(-direction.Z, 0, direction.X)
+            for _, offset in ipairs({0, -1.5, 1.5}) do
+                if workspaceService:Raycast(root.Position + Vector3.new(0, 1.5, 0) + side * offset,
+                    direction * distance, orbit.rays) then return end
+            end
+            local cleared = startRisk < 0.12
+            local activeCleared = startActive < 0.12
+            local exposure = 0
+            local steps = math.max(1, math.ceil(distance / 1.25))
+            for index = 1, steps do
+                local travel = distance * index / steps
+                local risk, active = riskAt(root.Position + direction * travel, travel / speed)
+                if active < 0.12 then activeCleared = true
+                elseif activeCleared then return end
+                if risk < 0.12 then
+                    cleared = true
+                elseif cleared or risk > startRisk + 0.01 then
+                    return
+                end
+                exposure = exposure + risk
+            end
+            if not cleared then return end
+            local score = exposure * 100 + preference + (sign == orbit.sign and 0 or 0.2)
+            if score < bestScore then best, bestSign, bestScore = direction, sign, score end
+        end
+        for _, sign in ipairs({orbit.sign, -orbit.sign}) do
+            for index, advance in ipairs({0.45, 0.8, 1.2, 1.8}) do
+                local targetAngle = angle + sign * advance
+                consider(Vector3.new(spot.x + math.cos(targetAngle) * radius, root.Position.Y,
+                    spot.z + math.sin(targetAngle) * radius), sign, index * 0.01)
+            end
+        end
+        -- A clear inward chord is preferable to stopping under an attack.
+        consider(Vector3.new(spot.x, root.Position.Y, spot.z), orbit.sign, 0.3)
+        movement.cmdDir = best
+        movement.cmdAt = rt.brainNow or now
+        movement.driving = best ~= nil
+        movementBoost.steer(best)
+        humanoid:Move(best or Vector3.zero, false)
+        if best then
+            orbit.sign = bestSign
+            setState("SAFE SPOT: circling inside first-boss refuge")
+        else
+            setState("SAFE SPOT: waiting inside refuge for a clear circle path")
+        end
+        return true
+    end
     context.archRefugeTick = function(humanoid, root, now)
         local field = capturedContext[3].safeField
         local spots = field and (field.gsSpots or capturedContext[3].safeSpots)
@@ -94746,8 +94830,24 @@ components.movementCombat = function(context)
             or #spots == 0 or now < (field.from or now) - 3
             or now > (field.untilAt or now) then return false end
         if not context.gsSafePick then return false end
-        local ok, spot, via = pcall(context.gsSafePick,
-            root.Position, field, spots, now, context.speedNormal())
+        local insideSpot
+        for _, candidate in ipairs(spots) do
+            local visible = not candidate.part or (candidate.part.Parent and candidate.part.Transparency < 0.95)
+            if visible then
+                local dx, dz = root.Position.X - candidate.x, root.Position.Z - candidate.z
+                local inset = math.max((candidate.r or 0) - math.max(3, capturedContext[1].gsSafeEdge or 1), 2)
+                if dx * dx + dz * dz <= inset * inset then
+                    insideSpot = candidate
+                    if capturedContext[2].archRefugeOrbit
+                        and capturedContext[2].archRefugeOrbit.spot == candidate then break end
+                end
+            end
+        end
+        local ok, spot, via = true, insideSpot, nil
+        if not spot then
+            ok, spot, via = pcall(context.gsSafePick,
+                root.Position, field, spots, now, context.speedNormal())
+        end
         if not ok then
             capturedContext[2].lastError = "refuge entry: " .. tostring(spot)
             return false
@@ -94758,9 +94858,7 @@ components.movementCombat = function(context)
         combatBrain.waypoints = nil
         capturedContext[2].gsZP = nil
         if dx * dx + dz * dz <= inset * inset then
-            releaseMover(humanoid, root)
-            humanoid:Move(Vector3.zero, false)
-            setState("SAFE SPOT: holding inside first-boss refuge")
+            context.archRefugeCircle(humanoid, root, spot, field, now)
         else
             helper2(humanoid, root, via or Vector3.new(spot.x, root.Position.Y, spot.z),
                 context.speedNormal(), 0.5)
@@ -165866,7 +165964,7 @@ do
     local sensedRoots, sensorAt = {}, -math.huge
     local forcedLook = false
     local savedAutoRotate = true
-    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-23-latency-work-reduction" }
+    context.V6RoomEntry = { kicks = 0, last = nil, build = "2026-10-23-confined-refuge-orbit" }
     -- Run after render/player input and immediately before physical movement.
     local motionSignal = runService.PreSimulation or runService.RenderStepped or runService.Heartbeat
     _G.HL_V6_CONTROLLER_REPORT = context.V6RoomEntry
