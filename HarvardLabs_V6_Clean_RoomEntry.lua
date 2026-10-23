@@ -166370,13 +166370,29 @@ function Planner:cancel(e,reason)
     self.route,self.progress,self.invalidSince=nil,nil,nil
     self.nextPlan=0
 end
+function Planner:destinationClear(e,points,travel)
+    local target=points[#points]
+    if not target then return true end
+    for _,circle in ipairs(e.circles or {}) do
+        if (circle.expires or huge)>travel and dist(target,circle)<circle.r-0.01 then return false end
+    end
+    return true
+end
 function Planner:choose(e)
     local selected,score
     local reject={}
     local function consider(points)
+        local target=points[#points]
+        -- A short dwell can finish before a warned circle fires. Do not
+        -- mistake a point still inside that warning for an escape destination.
+        local travel,origin=0,{x=e.x,z=e.z}
+        for _,point in ipairs(points) do travel=travel+dist(origin,point)/e.speed origin=point end
+        if not self:destinationClear(e,points,travel) then
+            reject['inside circle warning']=(reject['inside circle warning'] or 0)+1
+            return
+        end
         local result,why=self:evaluate(e,points,0.3)
         if not result then reject[why]=(reject[why] or 0)+1 return end
-        local target=points[#points]
         for _,bad in ipairs(self.blocked) do
             if e.now<bad.untilAt and dist(target,bad)<2 then return end
         end
@@ -166395,6 +166411,33 @@ function Planner:choose(e)
             cost=cost+math.abs(dist(target,e.circle)-e.circle.r*0.72)
         end
         if not score or cost<score then selected,score=points,cost end
+    end
+    -- Geometry-driven exits cover circles wider than the generic search
+    -- radii and narrow openings between overlapping circles.
+    local circles=e.circles or {}
+    for _,circle in ipairs(circles) do
+        local angle=math.atan2 and math.atan2(e.z-circle.z,e.x-circle.x)
+            or math.atan(e.z-circle.z,e.x-circle.x)
+        consider({{x=circle.x+math.cos(angle)*(circle.r+0.4),z=circle.z+math.sin(angle)*(circle.r+0.4)}})
+        for i=0,23 do
+            local a=i*math.pi/12
+            consider({{x=circle.x+math.cos(a)*(circle.r+0.4),z=circle.z+math.sin(a)*(circle.r+0.4)}})
+        end
+    end
+    for i=1,#circles do
+        for j=i+1,#circles do
+            local a,b=circles[i],circles[j]
+            local d=dist(a,b)
+            local ra,rb=a.r+0.4,b.r+0.4
+            if d>0.001 and d<ra+rb and d>math.abs(ra-rb) then
+                local along=(ra*ra-rb*rb+d*d)/(2*d)
+                local height=sqrt(math.max(0,ra*ra-along*along))
+                local ux,uz=(b.x-a.x)/d,(b.z-a.z)/d
+                local x,z=a.x+ux*along,a.z+uz*along
+                consider({{x=x-uz*height,z=z+ux*height}})
+                consider({{x=x+uz*height,z=z-ux*height}})
+            end
+        end
     end
     if e.mode=='refuge' and e.circle then
         local angle=math.atan2 and math.atan2(e.z-e.circle.z,e.x-e.circle.x)
@@ -166498,6 +166541,9 @@ function Planner:step(e)
             elseif e.now-self.progress.at>=0.45 then self:cancel(e,'no physical progress') end
             if self.route then
                 local result,why,when=self:evaluate(e,self.route.points,self.route.prefix and 0 or 0.1)
+                if result and not self.route.prefix and not self:destinationClear(e,self.route.points,result.time) then
+                    result,why,when=nil,'new circle covers destination',0
+                end
                 if result then
                     self.invalidSince=nil
                     return command
@@ -166526,10 +166572,10 @@ function Planner:step(e)
     if e.mode=='rows' and self:evaluate(e,{},0.6) and enemy>=9 then
         return {kind='hold',reason='aligned in checked row opening',holdAttack=false}
     end
-    local specialized=e.mode=='entry' or e.mode=='refuge' or e.mode=='rows'
-    local preferMotion=e.mode=='entry' or e.mode=='refuge'
+    local specialized=e.mode=='entry' or e.mode=='refuge' or e.mode=='rows' or e.mode=='circles'
+    local preferMotion=e.mode=='entry' or e.mode=='refuge' or e.mode=='circles'
         or (e.mode~='rows' and (e.combat or enemy<28))
-    self.defensive=not safeNative or enemy<20 or e.mode=='entry' or e.mode=='rows'
+    self.defensive=not safeNative or enemy<20 or e.mode=='entry' or e.mode=='rows' or e.circleDanger
 
     -- Do not turn clean dungeon travel into constant evasion. Native room
     -- navigation remains responsible for long paths and doorway traversal.
@@ -166573,7 +166619,7 @@ return Planner
 return function(context, Planner)
     local rt, world, player = context.RT, context.Workspace, context.LocalPlayer
     local planner=Planner.new()
-    local report={build='V7-predictive-waypoints-4-continuous-handoff',frames=0,errors=0,decisions={},healthEvents={}}
+    local report={build='V7-predictive-waypoints-5-circle-exits',frames=0,errors=0,decisions={},healthEvents={}}
     local character, rays, lastNative, wasOwned, lastCall=nil,nil,nil,false,-math.huge
     local lastHealth, lastMode, lastSpot=nil,nil,nil
     local lastRowsAt, nativeIdleAt=-math.huge,os.clock()
@@ -166769,6 +166815,33 @@ return function(context, Planner)
             if context.gsB1Lanes and context.gsB1Lanes(now) then lastRowsAt=now end
             if now-lastRowsAt<0.5 then mode,modeKey='rows','rows' end
         end
+        local circles,circleDanger={},false
+        if bossPresent then
+            for part,entry in pairs(context.RD and context.RD.models or {}) do
+                if entry.name=='gs circle' and not entry.fired and part.Parent and part:IsA('BasePart') then
+                    local expires=(entry.untilAt or (entry.spawn or now)+1.6)-now
+                    local size=part.Size
+                    local lo,hi=math.min(size.X,size.Y,size.Z),math.max(size.X,size.Y,size.Z)
+                    local radius=(size.X+size.Y+size.Z-lo-hi)/2
+                        +(context.DG and context.DG.reach or 2)+2
+                    local dx,dz=pos.X-part.Position.X,pos.Z-part.Position.Z
+                    if expires>0 and dx*dx+dz*dz<(radius+30)^2 and math.abs(part.Position.Y-pos.Y)<14 then
+                        circles[#circles+1]={x=part.Position.X,z=part.Position.Z,r=radius,expires=expires}
+                        if dx*dx+dz*dz<radius*radius then circleDanger=true end
+                        if #circles>=10 then break end
+                    end
+                end
+            end
+        end
+        table.sort(circles,function(a,b)
+            local da=math.sqrt((pos.X-a.x)^2+(pos.Z-a.z)^2)-a.r
+            local db=math.sqrt((pos.X-b.x)^2+(pos.Z-b.z)^2)-b.r
+            return da<db
+        end)
+        if circleDanger and not activeRefuge then
+            mode,modeKey='circles','circles'
+        end
+        report.circleWarnings=#circles
         if not goal and mode=='normal' then
             local brain=context.BR
             local g=brain and (brain.goTo or brain.target and brain.target.root and brain.target.root.Position)
@@ -166798,7 +166871,7 @@ return function(context, Planner)
         local ping=tonumber(rt.pingS or rt.dataPingS) or 0
         if ping>2 then ping=ping/1000 end
         local margin=math.clamp(ping*0.5+0.04,0.04,0.2)
-        local e={now=now,x=pos.X,z=pos.Z,speed=27,mode=mode,modeKey=modeKey,goal=goal,circle=circle,combat=bossPresent,
+        local e={now=now,x=pos.X,z=pos.Z,speed=27,mode=mode,modeKey=modeKey,goal=goal,circle=circle,combat=bossPresent,circles=circles,circleDanger=circleDanger,
             native=lastNative and now-lastNative.at<0.25 and lastNative or {x=0,z=0}}
         if mode=='normal' and goal and now-nativeIdleAt>0.45 then
             local dx,dz=goal.x-pos.X,goal.z-pos.Z
